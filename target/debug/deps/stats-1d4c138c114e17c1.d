@@ -1,0 +1,11 @@
+/Users/epa127/Desktop/csbrown/cs2690/aspen-rust/target/debug/deps/libstats-1d4c138c114e17c1.rmeta: /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/lib.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/frequency.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/minmax.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/online.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/unsorted.rs
+
+/Users/epa127/Desktop/csbrown/cs2690/aspen-rust/target/debug/deps/libstats-1d4c138c114e17c1.rlib: /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/lib.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/frequency.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/minmax.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/online.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/unsorted.rs
+
+/Users/epa127/Desktop/csbrown/cs2690/aspen-rust/target/debug/deps/stats-1d4c138c114e17c1.d: /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/lib.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/frequency.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/minmax.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/online.rs /Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/unsorted.rs
+
+/Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/lib.rs:
+/Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/frequency.rs:
+/Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/minmax.rs:
+/Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/online.rs:
+/Users/epa127/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/streaming-stats-0.2.3/src/unsorted.rs:

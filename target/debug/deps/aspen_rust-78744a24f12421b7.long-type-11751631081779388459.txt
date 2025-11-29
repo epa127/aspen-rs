@@ -1,0 +1,1 @@
+fn(smol::async_net::TcpStream, std::net::SocketAddr, std::sync::Arc<server::Store>) {server::Server::init::{closure#0}::worker}

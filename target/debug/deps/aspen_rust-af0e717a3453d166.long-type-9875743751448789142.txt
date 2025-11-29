@@ -1,0 +1,3 @@
+core::result::Result<client::ClientThread, alloc::boxed::Box<dyn core::any::Any + core::marker::Send>>
+client::ClientThread: std::convert::From<std::result::Result<client::ClientThread, std::boxed::Box<dyn std::any::Any + std::marker::Send>>>
+std::result::Result<client::ClientThread, std::boxed::Box<dyn std::any::Any + std::marker::Send>>
