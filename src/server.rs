@@ -1,5 +1,5 @@
-use std::{collections::HashMap, fs::File, net::SocketAddr, sync::{Arc, mpsc::{Receiver, SyncSender}}};
-use smol::{future::yield_now, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, stream};
+use std::{collections::HashMap, fs::File, net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
+use smol::{future::yield_now, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 use crate::{BUF_LEN, CAPACITY, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}};
 
 const YIELD_FREQ: usize = 7; // yield every 2^n best effort sub-operations
@@ -39,25 +39,31 @@ impl Store {
   }
 }
 
-pub struct Server;
+pub trait Server {
+  fn init(port: usize, rx: SyncSender<()>);
+}
+pub struct DefaultSmolServer;
 
-impl Server {
-  pub fn init(port: usize, rx: SyncSender<()>) {
-    println!("Creating database...");
+impl Server for DefaultSmolServer {
+  fn init(port: usize, rx: SyncSender<()>) {
+    println!("Building database...");
     let store = Arc::new(Store::new());
-    println!("Successfully created database with {} keys", store.store.len());
+    println!("Successfully created database with {} keys. Starting TCP listener...", store.store.len());
     smol::block_on(async {
-      println!("Starting TCP Listener...");
       let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
-      println!("TCP Listener bound to port {port}. Now accepting connections.");
+      println!("TCP Listener bound to port {port}. Now accepting connections...");
       rx.send(()).unwrap();
+      let mut i = true;
       loop {
         let store = store.clone();
         let (stream, addr) = listener.accept().await.unwrap();
         async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
           Worker::new(stream, addr, store.clone()).run().await;
         }
-        println!("Server accepted connection with addr {:?}. Now spawning worker...", addr);
+        if i {
+          println!("Server accepted first connection at addr {:?}. Now spawning workers...", addr);
+          i = false;
+        }
         smol::spawn(worker(stream, addr, store)).detach();
       }
     });
@@ -66,7 +72,7 @@ impl Server {
 
 struct Worker {
   stream: TcpStream,
-  addr: SocketAddr,
+  _addr: SocketAddr,
   store: Arc<Store>,
 }
 
@@ -74,7 +80,7 @@ impl Worker {
   fn new(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) -> Self {
     Worker {
       stream,
-      addr, 
+      _addr: addr, 
       store
     }
   }

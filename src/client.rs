@@ -53,6 +53,7 @@ impl Client {
     for handle in handles {
       client_threads.push(handle.join().unwrap());
     }
+
     let tp_time= tp_timer.elapsed().as_secs_f32();
     println!("All requests fulfilled in {tp_time} seconds! Calculating statistics...");
 
@@ -234,7 +235,7 @@ impl Connection {
       if read_buf.len() < total_exp_len {
         return Ok(None);
       } else if read_buf.len() == total_exp_len {
-        let res = Response::deserialize(read_buf)?;
+        let _res = Response::deserialize(read_buf)?;
         // optional check for response
         let latency = start_time.elapsed().as_micros();
         self.status = ConnectionStatus::Ready;

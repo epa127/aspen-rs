@@ -1,6 +1,6 @@
 use std::{sync::mpsc, thread};
 
-use aspen_rust::{client, server};
+use aspen_rust::{client, server::{self, Server}};
 
 fn main() {
     println!("Starting benchmark...");
@@ -8,7 +8,7 @@ fn main() {
     let (tx, rx) = mpsc::sync_channel::<()>(1);
 
     thread::spawn(move || {
-        server::Server::init(port, tx);
+        server::DefaultSmolServer::init(port, tx);
     });
 
     rx.recv().unwrap();
