@@ -15,6 +15,6 @@ fn main() {
 
     println!("Starting main client thread...");
     
-    client::Client::new(250000, 0.0001, 8, 32).run_benchmark(port);
+    client::Client::new(25, 0.0001, 0.1, 4, 16).run(port);
 }
 

@@ -1,35 +1,39 @@
-use std::{fs::{self}, io::{Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
+use std::{collections::HashMap, fs::{self, File}, io::{Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
 use hdrhistogram::Histogram;
 use rand::Rng;
 
 use crate::{BUF_LEN, LEN_LENGTH, SIG_FIG, packet::{Packet, PacketType, Request, RequestType, Response, ResponseType}};
 
+#[derive(Debug)]
 pub struct Client {
   be_lc_ratio: f32,
-  workload: usize,
-  num_threads: usize,
   conns_per_thr: usize,
+  lc_write_read_ratio: f32,
+  num_threads: usize,
+  workload: usize,
 }
 
 impl Client {
-  pub fn new(workload: usize, be_lc_ratio: f32, num_threads: usize, conns_per_thr: usize) -> Self {
+  pub fn new(workload: usize, be_lc_ratio: f32, lc_write_read_ratio: f32, num_threads: usize, conns_per_thr: usize) -> Self {
     Client { 
-      be_lc_ratio, 
-      workload,
-      num_threads,
+      be_lc_ratio,
       conns_per_thr,
+      lc_write_read_ratio,
+      num_threads,
+      workload,
     }
   }
 
-  pub fn run_benchmark(&self, port: usize) {
+  pub fn run(&self, port: usize) {
     let mut handles: Vec<JoinHandle<ClientThread>> = Vec::new();
     println!("Creating {} client threads", self.num_threads);
     for _ in 0..self.num_threads {
       let workload = self.workload / self.num_threads;
       let ratio = self.be_lc_ratio;
       let conns_per_thr = self.conns_per_thr;
+      let wr_ratio = self.lc_write_read_ratio;
       handles.push(
-        thread::spawn(move || {ClientThread::init(port, workload, ratio, conns_per_thr)})
+        thread::spawn(move || {ClientThread::init(port, workload, ratio, conns_per_thr, wr_ratio)})
       );
     }
 
@@ -57,54 +61,129 @@ impl Client {
     let tp_time= tp_timer.elapsed().as_secs_f32();
     println!("All requests fulfilled in {tp_time} seconds! Calculating statistics...");
 
-    let mut be_agg: Histogram<u64>= Histogram::new_with_bounds(1, u64::MAX,SIG_FIG).unwrap();
-    let mut lc_agg: Histogram<u64>= Histogram::new_with_bounds(1, u64::MAX,SIG_FIG).unwrap();
-
-    for thr in client_threads {
-      thr.be_latencies.iter().for_each(|i| {let _ = be_agg.record(*i as u64);});
-      thr.lc_latencies.iter().for_each(|i| {let _ = lc_agg.record(*i as u64);});
+    let mut stat_map: HashMap<ResponseType, Histogram<u64>> = HashMap::new();
+    for i in ResponseType::iterator() {
+      stat_map.insert(i, Histogram::new_with_bounds(1, u64::MAX,SIG_FIG).unwrap());
     }
 
-    let datetime = chrono::offset::Local::now();
-    let header = format!("--- BENCHMARK TEST: {datetime} ---\n");
-    let setup = format!("SETUP:\n    THREADS: {},\n    CONNECTIONS PER THREAD: {},\n    NUM TASKS: {}\n    BE:LC RATIO: {} ({}:{})\n\n",
-        self.num_threads, self.conns_per_thr, self.workload, self.be_lc_ratio, be_agg.len(), lc_agg.len());
-    let throughput = format!("THROUGHPUT: {} TASKS / {} SECONDS = {} TASKS PER SECOND\n\n", self.workload, tp_time, self.workload as f32 / tp_time);
-    let be_stats = format!("BE STATS:\n    p50 LATENCY: {} µs\n    p95 LATENCY: {} µs\n    p99 LATENCY: {} µs\n    p99.9 LATENCY: {} µs\n    MEAN LATENCY: {} µs\n    STD DEV: {} µs\n\n", 
-        be_agg.value_at_quantile(0.5), lc_agg.value_at_quantile(0.95), be_agg.value_at_quantile(0.99), be_agg.value_at_quantile(0.999), be_agg.mean(), be_agg.stdev());
-    let lc_stats = format!("LC STATS:\n    p50 LATENCY: {} µs\n    p95 LATENCY: {} µs\n    p99 LATENCY: {} µs\n    p99.9 LATENCY: {} µs\n    MEAN LATENCY: {} µs\n    STD DEV: {} µs\n\n", 
-        lc_agg.value_at_quantile(0.5), lc_agg.value_at_quantile(0.95), lc_agg.value_at_quantile(0.99), lc_agg.value_at_quantile(0.999), lc_agg.mean(), lc_agg.stdev());
-    // let data = format!("DATA:\n    BE DATA: {:?}\n    LC DATA: {:?}", be_agg, lc_agg);
-    let prev = String::from_utf8_lossy(&fs::read("out/benchmark.txt").unwrap()).to_string();
-    fs::write("out/benchmark.txt", format!("{header}{setup}{throughput}{be_stats}{lc_stats}{prev}")).unwrap();
+    for thr in client_threads {
+      for (t, l) in thr.latencies {
+        let hist = stat_map.get_mut(&t).unwrap();
+        l.iter().for_each(|i| {let _ = hist.record(*i as u64);});
+      }
+    }
+
+    self.general_results(tp_time, &stat_map);
+    self.latency_by_quant_distr(&stat_map);
     
     println!("Completed benchmark!");
+  }
+
+  fn general_results(&self, total_secs: f32, stat_map: &HashMap<ResponseType, Histogram<u64>>) {
+    let datetime = chrono::offset::Local::now();
+    let header = format!("--- BENCHMARK TEST: {datetime} ---\n");
+    
+    let setup = format!("SETUP:\n    THREADS: {},\n    CONNECTIONS PER THREAD: {},\n    NUM TASKS: {}\n    BE:LC RATIO: {}\n    LC WRITE:READ RATIO: {}\n\n",
+        self.num_threads, self.conns_per_thr, self.workload, self.be_lc_ratio, self.lc_write_read_ratio);
+    let throughput = format!("THROUGHPUT: {} TASKS / {} SECONDS = {} TASKS PER SECOND\n\n", self.workload, total_secs, self.workload as f32 / total_secs);
+
+    let mut stats = String::new();
+    for (t, hist) in stat_map {
+      let title = format!("{:?} STATS:\n", t);
+      let size = format!("     SIZE: {}\n", hist.len());
+
+      let vals = [
+        hist.value_at_quantile(0.5) as f64,
+        hist.value_at_quantile(0.95) as f64,
+        hist.value_at_quantile(0.99) as f64,
+        hist.value_at_quantile(0.999) as f64,
+        hist.mean(),
+        hist.stdev()
+      ];
+
+      let mut val_strs: Vec<String> = Vec::new();
+
+      for val in vals {
+        if val < 1e4 {
+          // micros
+          val_strs.push(format!("{} µs", val as u64));
+        } else if val < 1e7 {
+          // millis
+          val_strs.push(format!("{:.3} ms", (val / 1000.0)));
+        } else {
+          // seconds
+          val_strs.push(format!("{:.6} secs", (val / 1000000.0)));
+        }
+      }
+      
+      let median = format!("     p50 LATENCY: {}\n", val_strs[0]);
+      let p95 = format!("     p95 LATENCY: {}\n", val_strs[1]);
+      let p99 = format!("     p99 LATENCY: {}\n", val_strs[2]);
+      let p999 = format!("     p99.9 LATENCY: {}\n", val_strs[3]);
+      let mean = format!("     MEAN LATENCY: {}\n", val_strs[4]);
+      let stddev = format!("     STD DEV: {}\n", val_strs[5]);
+
+      stats = format!("{stats}{title}{size}{median}{p95}{p99}{p999}{mean}{stddev}\n");
+    }
+
+    // let data = format!("DATA:\n    BE DATA: {:?}\n    LC DATA: {:?}", be_agg, lc_agg);
+    let prev = String::from_utf8_lossy(&fs::read("out/benchmark.txt").unwrap()).to_string();
+    fs::write("out/benchmark.txt", format!("{header}{setup}{throughput}{stats}{prev}")).unwrap();
+  }
+
+  fn latency_by_quant_distr(&self, stat_map: &HashMap<ResponseType, Histogram<u64>>) {
+    for (t, hist) in stat_map {
+      let path = match t {
+        ResponseType::BeRead => "beread",
+        ResponseType::LcRead => "lcread",
+        ResponseType::LcWrite => "lcwrite",
+      };
+
+      let file = File::open("bench/quantiles.txt").unwrap();
+      let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(file);
+      let quantiles: Vec<f64> = rdr.records().map(
+        |s| s.unwrap().get(0).unwrap().to_string().parse::<f64>().unwrap()).collect();
+      
+      let mut hist_data = format!("{:^8}    {:^8}    {:^8}    {:^8.3}\n", "Value", "Quantile", "Agg Count", "1/1-quantile");
+      for quantile in quantiles {
+        hist_data = format!("{hist_data}{:>8}    {:>8}    {:>8}    {:>8.3}\n",
+         hist.value_at_quantile(quantile), quantile, (hist.len() as f64 * quantile) as u64, 1.0 / (1.0 - quantile));
+      }
+      let _ = fs::write(format!("out/{path}.txt"), hist_data);
+    }
   }
 }
 
 struct ClientThread {
   conns_per_thr: usize,
   connections: Vec<Connection>,
-  be_latencies: Vec<u128>,
-  lc_latencies: Vec<u128>,
+  latencies: HashMap<ResponseType, Vec<u128>>,
   remaining_work: usize,
   be_prob: f32,
+  wr_lc_prob: f32,
 }
 
 impl ClientThread {
-  fn init(port: usize, workload: usize, be_prob: f32, conns_per_thr: usize) -> Self {
+  fn init(port: usize, workload: usize, be_prob: f32, conns_per_thr: usize, wr_lc_prob: f32) -> Self {
     let mut conns: Vec<Connection> = Vec::new();
     for _ in 0..conns_per_thr {
       conns.push(Connection::new(format!("127.0.0.1:{port}").as_str()).unwrap());
     }
 
+    let mut latencies: HashMap<ResponseType, Vec<u128>> = HashMap::new();
+    for t in ResponseType::iterator() {
+      latencies.insert(t, Vec::new());
+    }
+
     ClientThread {
       conns_per_thr,
       connections: conns,
-      be_latencies: Vec::new(),
-      lc_latencies: Vec::new(),
+      latencies,
       remaining_work: workload,
-      be_prob
+      be_prob,
+      wr_lc_prob
     }
   }
 
@@ -113,12 +192,16 @@ impl ClientThread {
     while self.remaining_work > 0 || tasks_pending > 0 {
       let i = rand::rng().random_range(0..self.conns_per_thr);
       let conn = self.connections.get_mut(i).expect("Connection should exist.");
+      // println!("Chose connection at {} with status {:?}", conn.stream.local_addr().unwrap().port(), conn.status);
       match conn.status.kind() {
         ConnStateType::Ready => {
           if self.remaining_work > 0 {
             let be_rat: f32 = rand::rng().random();
+            let wr_rat: f32 = rand::rng().random();
             let req = if be_rat <= self.be_prob {
               Request::random(RequestType::BeRead)
+            } else if wr_rat <= self.wr_lc_prob {
+              Request::random(RequestType::LcWrite)
             } else {
               Request::random(RequestType::LcRead)
             };
@@ -131,11 +214,8 @@ impl ClientThread {
           conn.resend_request()?;
         },
         ConnStateType::ReadingResponse => {
-          if let Ok(Some((res_type, latency))) = conn.try_read() {
-            match res_type {
-              ResponseType::BestEffort => {self.be_latencies.push(latency);},
-              ResponseType::LatencyCritical => {self.lc_latencies.push(latency);},
-            }
+          if let Some((res_type, latency)) = conn.try_read()? {
+            self.latencies.get_mut(&res_type).unwrap().push(latency);
             tasks_pending -= 1;
           }
         }
@@ -162,6 +242,7 @@ impl Connection {
   }
 
   fn send_initial_request(&mut self, req: Request) -> Result<(), String> {
+    // println!("Sending {:?} from {}", req.kind(), self.stream.local_addr().unwrap().port());
     let request= req.serialize();
     let req_bytes = request.len();
     let start_time = Instant::now();
@@ -187,11 +268,12 @@ impl Connection {
 
   fn resend_request(&mut self) -> Result<(), String> {
     if let ConnectionStatus::WritingRequest { req, start_time, write_buf, offset } = &mut self.status {
+      // println!("Resending {:?} from {}", req, self.stream.local_addr().unwrap().port());
       let req_bytes = write_buf.len();
       let bytes_written = self.stream.write(&write_buf[*offset..req_bytes]).map_err(|e| e.to_string())?;
       if bytes_written == req_bytes {
         self.status = ConnectionStatus::ReadingResponse { 
-          exp_type: ResponseType::from_request(req.clone()), 
+          exp_type: ResponseType::from_request(*req), 
           start_time: *start_time, 
           read_buf: Vec::new(), 
           expected_len: None 
@@ -235,11 +317,11 @@ impl Connection {
       if read_buf.len() < total_exp_len {
         return Ok(None);
       } else if read_buf.len() == total_exp_len {
-        let _res = Response::deserialize(read_buf)?;
+        let _res = Response::deserialize(read_buf);
         // optional check for response
         let latency = start_time.elapsed().as_micros();
         self.status = ConnectionStatus::Ready;
-        // println!("Response {:?} received from {} in {} µs", res, self.stream.local_addr().unwrap(), latency);
+        // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
         return Ok(Some((packet_type, latency)));
       } else {
         return Err(format!("Read more bytes than expected: {:?}", read_buf));
@@ -249,7 +331,7 @@ impl Connection {
   }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ConnectionStatus {
   Ready,
   WritingRequest {

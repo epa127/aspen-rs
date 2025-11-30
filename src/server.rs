@@ -1,32 +1,44 @@
 use std::{collections::HashMap, fs::File, net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
-use smol::{future::yield_now, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use smol::{future::yield_now, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, lock::RwLock};
 use crate::{BUF_LEN, CAPACITY, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}};
 
-const YIELD_FREQ: usize = 7; // yield every 2^n best effort sub-operations
+const YIELD_FREQ: usize = 5; // yield every 2^n best effort sub-operations
+
 struct Store {
-  pub store: HashMap<usize, String>
+  pub store: RwLock<HashMap<usize, String>>
 }
 
 impl Store {
-  fn new() -> Self {
+  fn new() -> (Self, usize) {
     let file = File::open("bench/usernames.txt").unwrap();
     let mut rdr = csv::Reader::from_reader(file);
     let mut map: HashMap<usize, String> = HashMap::with_capacity(CAPACITY);
     for (i, result) in rdr.records().flatten().enumerate() {
       map.insert(i, result.iter().collect());
     }
-    Store {
-      store: map
-    }
+    let len = map.len();
+    
+    (Store {
+      store: RwLock::new(map)
+    }, len)
   }
 
   async fn lc_read_task(&self, key: usize) -> Option<String> {
-    self.store.get(&key).cloned()
+    self.store.read().await.get(&key).cloned()
+  }
+
+  async fn lc_write_task(&self, key: usize, value: String) -> Option<String> {
+    self.store.write().await.insert(key, value)
   }
 
   async fn be_task(&self, substring: String) -> usize {
     let mut freq: usize = 0;
-    for (i, username) in self.store.values().enumerate() {
+
+    let s = self.store.read().await;
+    let e = s.clone();
+    drop(s);
+
+    for (i, username) in e.values().enumerate(){
       if username.contains(&substring) {
         freq += 1;
       }
@@ -47,15 +59,16 @@ pub struct DefaultSmolServer;
 impl Server for DefaultSmolServer {
   fn init(port: usize, rx: SyncSender<()>) {
     println!("Building database...");
-    let store = Arc::new(Store::new());
-    println!("Successfully created database with {} keys. Starting TCP listener...", store.store.len());
+    let (store, store_len) = Store::new();
+    let safe_store = Arc::new(store);
+    println!("Successfully created database with {} keys. Starting TCP listener...", store_len);
     smol::block_on(async {
       let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
       println!("TCP Listener bound to port {port}. Now accepting connections...");
       rx.send(()).unwrap();
       let mut i = true;
       loop {
-        let store = store.clone();
+        let store = safe_store.clone();
         let (stream, addr) = listener.accept().await.unwrap();
         async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
           Worker::new(stream, addr, store.clone()).run().await;
@@ -134,14 +147,20 @@ impl Worker {
 
   async fn execute_task(&mut self, req: Request) -> Result<Response, String> {
     match req {
-      Request::BeRead { substring } => {
-        let freq: u64 = self.store.be_task(substring).await as u64;
-        Ok(Response::BestEffort { freq })
-      },
-      Request::LcRead { id } => {
-        let username = self.store.lc_read_task(id.try_into().map_err(|e: std::num::TryFromIntError| e.to_string())?).await.unwrap_or("".to_string());
-        Ok(Response::LatencyCritical { username })
-      },
+        Request::BeRead { substring } => {
+            let freq: u64 = self.store.be_task(substring).await as u64;
+            Ok(Response::BeRead { freq })
+          },
+        Request::LcRead { id } => {
+            let id = id.try_into().map_err(|e: std::num::TryFromIntError| e.to_string())?;
+            let username = self.store.lc_read_task(id).await;
+            Ok(Response::LcRead { username })
+          },
+        Request::LcWrite { id, username } => {
+            let id = id.try_into().map_err(|e: std::num::TryFromIntError| e.to_string())?;
+            let username = self.store.lc_write_task(id, username).await;
+            Ok(Response::LcWrite { username })
+        },
     }
   }
 
