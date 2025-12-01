@@ -1,85 +1,52 @@
-use std::{collections::HashMap, fs::File, net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
-use smol::{future::yield_now, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, lock::RwLock};
-use crate::{BUF_LEN, CAPACITY, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}};
+use std::{net::SocketAddr, str::FromStr, sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc::SyncSender}, thread};
+use smol::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use socket2::{Domain, SockAddr, Socket, Type};
+use crate::{BACKLOG, BUF_LEN, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}, store::{self, Store}};
 
-const YIELD_FREQ: usize = 5; // yield every 2^n best effort sub-operations
-
-struct Store {
-  pub store: RwLock<HashMap<usize, String>>
-}
-
-impl Store {
-  fn new() -> (Self, usize) {
-    let file = File::open("bench/usernames.txt").unwrap();
-    let mut rdr = csv::Reader::from_reader(file);
-    let mut map: HashMap<usize, String> = HashMap::with_capacity(CAPACITY);
-    for (i, result) in rdr.records().flatten().enumerate() {
-      map.insert(i, result.iter().collect());
-    }
-    let len = map.len();
-    
-    (Store {
-      store: RwLock::new(map)
-    }, len)
-  }
-
-  async fn lc_read_task(&self, key: usize) -> Option<String> {
-    self.store.read().await.get(&key).cloned()
-  }
-
-  async fn lc_write_task(&self, key: usize, value: String) -> Option<String> {
-    self.store.write().await.insert(key, value)
-  }
-
-  async fn be_task(&self, substring: String) -> usize {
-    let mut freq: usize = 0;
-
-    let s = self.store.read().await;
-    let e = s.clone();
-    drop(s);
-
-    for (i, username) in e.values().enumerate(){
-      if username.contains(&substring) {
-        freq += 1;
-      }
-
-      if (i & ((1 << YIELD_FREQ) - 1)) == 0 {
-        yield_now().await;
-      }
-    }
-    freq
-  }
-}
-
-pub trait Server {
-  fn init(port: usize, rx: SyncSender<()>);
-}
 pub struct DefaultSmolServer;
 
-impl Server for DefaultSmolServer {
-  fn init(port: usize, rx: SyncSender<()>) {
-    println!("Building database...");
-    let (store, store_len) = Store::new();
-    let safe_store = Arc::new(store);
-    println!("Successfully created database with {} keys. Starting TCP listener...", store_len);
-    smol::block_on(async {
-      let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
-      println!("TCP Listener bound to port {port}. Now accepting connections...");
-      rx.send(()).unwrap();
-      let mut i = true;
-      loop {
-        let store = safe_store.clone();
-        let (stream, addr) = listener.accept().await.unwrap();
-        async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
-          Worker::new(stream, addr, store.clone()).run().await;
-        }
-        if i {
-          println!("Server accepted first connection at addr {:?}. Now spawning workers...", addr);
-          i = false;
-        }
-        smol::spawn(worker(stream, addr, store)).detach();
-      }
-    });
+impl DefaultSmolServer {
+  pub fn init(num_threads: usize, port: usize, start_client: SyncSender<()>, database: Store) {
+    let safe_store = Arc::new(database);
+    let ready_count = Arc::new(AtomicUsize::new(0));
+
+    for i in 0..num_threads {
+      let store_clone = safe_store.clone();
+      let rx_clone = start_client.clone();
+      let ready_count_clone = ready_count.clone();
+      thread::spawn( move ||
+        smol::block_on(async {
+          let socket = Socket::new(Domain::IPV4, Type::STREAM, None).map_err(|e| e.to_string()).unwrap();
+          socket.set_reuse_port(true).map_err(|e| e.to_string()).unwrap();
+          let addr = SockAddr::from(SocketAddr::from_str(format!("127.0.0.1:{port}").as_str())
+              .map_err(|e| e.to_string()).unwrap());
+          socket.bind(&addr).map_err(|e| e.to_string()).unwrap();
+          socket.listen(BACKLOG).map_err(|e| e.to_string()).unwrap();
+          println!("TCP Listener bound to port {port}. Now accepting connections...");
+
+          let listener: std::net::TcpListener = socket.into();
+          let async_listener = TcpListener::try_from(listener).unwrap(); 
+          let prev = ready_count_clone.fetch_add(1, Ordering::SeqCst);
+          if prev + 1 == num_threads {
+              // this is the LAST thread to bind
+              rx_clone.send(()).unwrap();
+          }
+          let mut seen = true;
+          loop {
+            let store = store_clone.clone();
+            let (stream, addr) = async_listener.accept().await.unwrap();
+            async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
+              Worker::new(stream, addr, store.clone()).run().await;
+            }
+            if seen {
+              println!("Server {i} accepted first connection at addr {:?}. Now spawning workers...", addr);
+              seen = false;
+            }
+            smol::spawn(worker(stream, addr, store)).detach();
+          }
+        })
+      );
+    }
   }
 }
 

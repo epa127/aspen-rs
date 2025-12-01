@@ -88,7 +88,8 @@ impl Client {
     let throughput = format!("THROUGHPUT: {} TASKS / {} SECONDS = {} TASKS PER SECOND\n\n", self.workload, total_secs, self.workload as f32 / total_secs);
 
     let mut stats = String::new();
-    for (t, hist) in stat_map {
+    for t in ResponseType::iterator(){
+      let hist = stat_map.get(&t).unwrap();
       let title = format!("{:?} STATS:\n", t);
       let size = format!("     SIZE: {}\n", hist.len());
 
@@ -107,7 +108,7 @@ impl Client {
         if val < 1e4 {
           // micros
           val_strs.push(format!("{} µs", val as u64));
-        } else if val < 1e7 {
+        } else if val < 1e6 {
           // millis
           val_strs.push(format!("{:.3} ms", (val / 1000.0)));
         } else {
