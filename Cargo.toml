@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-channel = "2.5.0"
+async-executor = "1.13.3"
 chrono = "0.4.42"
 csv = "1.4.0"
+easy-parallel = "3.3.1"
+futures-lite = "2.6.1"
 hdrhistogram = "7.5.4"
 num_cpus = "1.17.0"
 rand = "0.9.2"

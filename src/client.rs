@@ -232,14 +232,14 @@ struct Connection {
 }
 
 impl Connection {
-  fn new(addr: &str) -> Result<Self, ()> {
-    if let Ok(stream) = TcpStream::connect(addr) {
-      return Ok(Connection { 
-        stream, 
-        status: ConnectionStatus::Ready 
-      });
-    } 
-    Err(())
+  fn new(addr: &str) -> Result<Self, String> {
+    match TcpStream::connect(addr) {
+      Ok(stream) => { Ok(Connection { 
+              stream, 
+              status: ConnectionStatus::Ready 
+            })}
+      Err(e) => Err(e.to_string())
+    }
   }
 
   fn send_initial_request(&mut self, req: Request) -> Result<(), String> {

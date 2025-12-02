@@ -1,52 +1,48 @@
-use std::{net::SocketAddr, str::FromStr, sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc::SyncSender}, thread};
+use std::{net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
 use smol::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
-use socket2::{Domain, SockAddr, Socket, Type};
-use crate::{BACKLOG, BUF_LEN, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}, store::{self, Store}};
+use crate::{BUF_LEN, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}, store::Store};
+
+
+use async_channel::unbounded;
+use async_executor::Executor;
+use easy_parallel::Parallel;
+use futures_lite::future;
 
 pub struct DefaultSmolServer;
 
 impl DefaultSmolServer {
   pub fn init(num_threads: usize, port: usize, start_client: SyncSender<()>, database: Store) {
     let safe_store = Arc::new(database);
-    let ready_count = Arc::new(AtomicUsize::new(0));
 
-    for i in 0..num_threads {
-      let store_clone = safe_store.clone();
-      let rx_clone = start_client.clone();
-      let ready_count_clone = ready_count.clone();
-      thread::spawn( move ||
-        smol::block_on(async {
-          let socket = Socket::new(Domain::IPV4, Type::STREAM, None).map_err(|e| e.to_string()).unwrap();
-          socket.set_reuse_port(true).map_err(|e| e.to_string()).unwrap();
-          let addr = SockAddr::from(SocketAddr::from_str(format!("127.0.0.1:{port}").as_str())
-              .map_err(|e| e.to_string()).unwrap());
-          socket.bind(&addr).map_err(|e| e.to_string()).unwrap();
-          socket.listen(BACKLOG).map_err(|e| e.to_string()).unwrap();
-          println!("TCP Listener bound to port {port}. Now accepting connections...");
+    let ex = Arc::new(Executor::new());
+    let (signal, shutdown) = unbounded::<()>();
 
-          let listener: std::net::TcpListener = socket.into();
-          let async_listener = TcpListener::try_from(listener).unwrap(); 
-          let prev = ready_count_clone.fetch_add(1, Ordering::SeqCst);
-          if prev + 1 == num_threads {
-              // this is the LAST thread to bind
-              rx_clone.send(()).unwrap();
-          }
-          let mut seen = true;
-          loop {
-            let store = store_clone.clone();
-            let (stream, addr) = async_listener.accept().await.unwrap();
-            async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
-              Worker::new(stream, addr, store.clone()).run().await;
+    Parallel::new()
+        // Run four executor threads.
+        .each(0..num_threads, |_| future::block_on(ex.run(shutdown.recv())))
+        // Run the main future on the current thread.
+        .finish(|| future::block_on(async {
+          let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
+          let mut i = true;
+          let ex_clone = ex.clone();
+          ex.run(async move {
+            println!("TCP Listener bound to port {port}. Now accepting connections...");
+            start_client.send(()).unwrap();
+            loop {
+              let store = safe_store.clone();
+              let (stream, addr) = listener.accept().await.unwrap();
+              async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
+                Worker::new(stream, addr, store.clone()).run().await;
+              }
+              if i {
+                println!("Server accepted first connection at addr {:?}. Now spawning workers...", addr);
+                i = false;
+              }
+              ex_clone.spawn(worker(stream, addr, store)).detach();
             }
-            if seen {
-              println!("Server {i} accepted first connection at addr {:?}. Now spawning workers...", addr);
-              seen = false;
-            }
-            smol::spawn(worker(stream, addr, store)).detach();
-          }
-        })
-      );
-    }
+          }).await;
+          drop(signal);
+        }));
   }
 }
 

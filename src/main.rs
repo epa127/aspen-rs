@@ -22,6 +22,6 @@ fn main() {
 
     println!("Starting main client thread...");
     
-    client::Client::new(250000, 0.0001, 0.1, client_threads, 256).run(port);
+    client::Client::new(2500, 0.1, 0.1, client_threads, 256).run(port);
 }
 
