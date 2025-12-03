@@ -15,6 +15,14 @@ pub trait MessageType {
   fn iterator() -> impl Iterator<Item = Self>;
 }
 
+#[allow(clippy::len_without_is_empty)]
+pub trait Header {
+  fn expected_len() -> usize;
+  fn len(&self) -> usize;
+  fn serialize(&self) -> Vec<u8>;
+  fn deserialize(buf: &[u8]) -> Result<Self, ParseError> where Self: std::marker::Sized;
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
 pub enum RequestType {
   BeRead,
@@ -53,25 +61,31 @@ impl MessageType for RequestType {
     }
 }
 
-struct MessageHeader {
-  kind: RequestType,
+struct MessageHeader<T: MessageType> {
+  kind: T,
   payload_len: usize,
 }
 
-impl MessageHeader {
+impl<T: MessageType> MessageHeader<T> {
+  fn new(kind: T, payload_len: usize) -> Self {
+    MessageHeader { kind, payload_len }
+  }
+}
+
+impl<T: MessageType> Header for MessageHeader<T> {
   fn expected_len() -> usize {
     1 + LEN_LENGTH
   }
 
   fn len(&self) -> usize {
-    MessageHeader::expected_len()
+    MessageHeader::<T>::expected_len()
   }
 
-  fn deserialize(packet: &[u8]) -> Result<MessageHeader,ParseError> {
+  fn deserialize(packet: &[u8]) -> Result<MessageHeader<T>,ParseError> {
     // Check for header (kind + Payload_len)
-    check_length(packet.len(), MessageHeader::expected_len())?;
+    check_length(packet.len(), MessageHeader::<T>::expected_len())?;
     
-    let kind = RequestType::from_value(packet[0])?;
+    let kind = T::from_value(packet[0])?;
     let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
     let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
 
@@ -86,6 +100,13 @@ impl MessageHeader {
       payload_len
     })
   }
+  
+  fn serialize(&self) -> Vec<u8> {
+    let mut packet: Vec<u8> = Vec::new();
+    packet.push(self.kind.value());
+    packet.extend_from_slice(&(self.payload_len as u64).to_be_bytes());
+    packet
+  }
 }
 
 struct PayloadHeader {
@@ -93,6 +114,12 @@ struct PayloadHeader {
 }
 
 impl PayloadHeader {
+  fn new(req_id: u64) -> Self {
+    PayloadHeader { req_id }
+  }
+}
+
+impl Header for PayloadHeader {
   fn expected_len() -> usize {
     LEN_LENGTH
   }
@@ -101,9 +128,13 @@ impl PayloadHeader {
     PayloadHeader::expected_len()
   }
 
+  fn serialize(&self) -> Vec<u8> {
+      self.req_id.to_be_bytes().to_vec()
+  }
+
   fn deserialize(payload: &[u8]) -> Result<PayloadHeader, ParseError> {
     // payload should have at least the req_id bytes
-    check_length(payload.len(), PayloadHeader::expected_len());
+    check_length(payload.len(), PayloadHeader::expected_len())?;
     let req_id_slice: [u8; 8] = payload[0..LEN_LENGTH].try_into().unwrap();
     let req_id = u64::from_be_bytes(req_id_slice);
     Ok(PayloadHeader { req_id })
@@ -165,34 +196,31 @@ impl Message for Request {
   }
 
   fn serialize(&self) -> Vec<u8> {
-    let mut packet: Vec<u8> = Vec::new();
-    packet.push(self.kind().value());
-    match self {
+    let payload = match self {
       Request::BeRead { substring, req_id } => {
-        let mut payload: Vec<u8> = req_id.to_be_bytes().to_vec();
+        let mut payload: Vec<u8> = PayloadHeader::new(*req_id).serialize();
         payload.extend_from_slice(substring.as_bytes());
-        packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        packet.extend_from_slice(&payload);
+        payload
       },
       Request::LcRead { req_id, id } => {
-        let mut payload: Vec<u8> = req_id.to_be_bytes().to_vec();
+        let mut payload: Vec<u8> = PayloadHeader::new(*req_id).serialize();
         payload.extend_from_slice(&id.to_be_bytes());
-        packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        packet.extend_from_slice(&payload);
+        payload
       },
       Request::LcWrite { req_id, id, username } => {
-        let mut payload = req_id.to_be_bytes().to_vec();
+        let mut payload: Vec<u8> = PayloadHeader::new(*req_id).serialize();
         payload.extend_from_slice(&id.to_be_bytes());
         payload.extend_from_slice(username.as_bytes());
-        packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        packet.extend_from_slice(&payload);
+        payload
       }
-    }
+    };
+    let mut packet = MessageHeader::new(self.kind(), payload.len()).serialize();
+    packet.extend_from_slice(&payload);
     packet
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
-    let header = MessageHeader::deserialize(&packet)?;
+    let header = MessageHeader::deserialize(packet)?;
     
     // Check for payload length
     check_length(packet.len(), header.len() + header.payload_len)?;
@@ -202,7 +230,7 @@ impl Message for Request {
     let rest_payload = &payload[payload_header.len()..];
     match header.kind {
         RequestType::BeRead => {
-          check_length(rest_payload.len(), 1);
+          check_length(rest_payload.len(), 1)?;
           let str = String::from_utf8_lossy(rest_payload).to_string();
           Ok(Request::BeRead { req_id: payload_header.req_id, substring: str })
         },
@@ -298,18 +326,15 @@ impl Message for Response {
   }
 
   fn serialize(&self) -> Vec<u8> {
-    let mut packet: Vec<u8> = Vec::new();
-    packet.push(self.kind().value());
-    match self {
+    let payload = match self {
       Response::BeRead { req_id, freq } => {
-        let mut payload = req_id.to_be_bytes().to_vec();
+        let mut payload = PayloadHeader::new(*req_id).serialize();
         payload.extend_from_slice(&freq.to_be_bytes());
 
-        packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        packet.extend_from_slice(&payload);
+        payload
       },
       Response::LcRead { req_id, username } | Response::LcWrite { req_id, username } => {
-        let mut payload: Vec<u8> = req_id.to_be_bytes().to_vec();
+        let mut payload = PayloadHeader::new(*req_id).serialize();
         match username {
             Some(username) => {
               payload.push(SOME_BYTE);
@@ -319,15 +344,16 @@ impl Message for Response {
               payload.push(NONE_BYTE);
             },
         }
-        packet.extend_from_slice(&payload.len().to_be_bytes());
-        packet.extend_from_slice(&payload);
+        payload
       }
-    }
+    };
+    let mut packet = MessageHeader::new(self.kind(), payload.len()).serialize();
+    packet.extend_from_slice(&payload);
     packet
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
-    let header = MessageHeader::deserialize(&packet)?;
+    let header = MessageHeader::deserialize(packet)?;
     
     // Check for payload length
     check_length(packet.len(), header.len() + header.payload_len)?;
