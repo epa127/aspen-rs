@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::{self, File}, io::{ErrorKind, Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
+use std::{collections::HashMap, fs::{self, File}, io::{ErrorKind, Read, Write}, net::TcpStream, sync::{Arc, atomic::{AtomicU64, Ordering}}, thread::{self, JoinHandle}, time::Instant};
 use hdrhistogram::Histogram;
 use rand::Rng;
 
@@ -26,14 +26,16 @@ impl Client {
 
   pub fn run(&self, port: usize) {
     let mut handles: Vec<JoinHandle<ClientThread>> = Vec::new();
+    let req_id = Arc::new(AtomicU64::new(0));
     println!("Creating {} client threads", self.num_threads);
     for _ in 0..self.num_threads {
       let workload = self.workload / self.num_threads;
       let ratio = self.be_lc_ratio;
       let conns_per_thr = self.conns_per_thr;
       let wr_ratio = self.lc_write_read_ratio;
+      let req_id = req_id.clone();
       handles.push(
-        thread::spawn(move || {ClientThread::init(port, workload, ratio, conns_per_thr, wr_ratio)})
+        thread::spawn(move || {ClientThread::init(port, workload, ratio, conns_per_thr, wr_ratio, req_id)})
       );
     }
 
@@ -164,10 +166,11 @@ struct ClientThread {
   remaining_work: usize,
   be_prob: f32,
   wr_lc_prob: f32,
+  req_id: Arc<AtomicU64>
 }
 
 impl ClientThread {
-  fn init(port: usize, workload: usize, be_prob: f32, conns_per_thr: usize, wr_lc_prob: f32) -> Self {
+  fn init(port: usize, workload: usize, be_prob: f32, conns_per_thr: usize, wr_lc_prob: f32, req_id: Arc<AtomicU64>) -> Self {
     let mut conns: Vec<Connection> = Vec::new();
     for _ in 0..conns_per_thr {
       conns.push(Connection::new(format!("127.0.0.1:{port}").as_str()).unwrap());
@@ -184,19 +187,22 @@ impl ClientThread {
       latencies,
       remaining_work: workload,
       be_prob,
-      wr_lc_prob
+      wr_lc_prob,
+      req_id
     }
   }
 
-  fn generate_random_request(&self) -> Request {
+  fn generate_random_request(&mut self) -> Request {
+    let req_id = self.req_id.load(Ordering::Relaxed);
+    self.req_id.fetch_add(1, Ordering::Relaxed);
     let be_rat: f32 = rand::rng().random();
     let wr_rat: f32 = rand::rng().random();
     if be_rat <= self.be_prob {
-      Request::random(RequestType::BeRead)
+      Request::random(RequestType::BeRead, req_id)
     } else if wr_rat <= self.wr_lc_prob {
-      Request::random(RequestType::LcWrite)
+      Request::random(RequestType::LcWrite, req_id)
     } else {
-      Request::random(RequestType::LcRead)
+      Request::random(RequestType::LcRead, req_id)
     }
   }
 
@@ -225,7 +231,6 @@ impl ClientThread {
         }
         Progress::ConnectionReset(in_flight) => {
           conn.reconnect()?;
-          // if the connection was in-flight, adjust tasks_pending?
           if in_flight {
             tasks_pending -= 1;
           }

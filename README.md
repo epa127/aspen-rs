@@ -9,7 +9,7 @@
 ### TODO LIST
 
 1. ~~Add `ECONNRESET` error handling~~
-2. Add `RequestID` to packets
+2. ~~Add `RequestID` to packets~~
 3. Add error packet type
 4. Lua packet dissector
 5. Implement Open Loop

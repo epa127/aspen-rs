@@ -113,19 +113,19 @@ impl Worker {
 
   async fn execute_task(&mut self, req: Request) -> Response {
     match req {
-        Request::BeRead { substring } => {
+        Request::BeRead { req_id, substring } => {
             let freq: u64 = self.store.be_task(substring).await as u64;
-            Response::BeRead { freq }
+            Response::BeRead { req_id, freq }
           },
-        Request::LcRead { id } => {
+        Request::LcRead { req_id, id } => {
             let id = id.try_into().unwrap();
             let username = self.store.lc_read_task(id).await;
-            Response::LcRead { username }
+            Response::LcRead { req_id, username }
           },
-        Request::LcWrite { id, username } => {
+        Request::LcWrite { req_id, id, username } => {
             let id = id.try_into().unwrap();
             let username = self.store.lc_write_task(id, username).await;
-            Response::LcWrite { username }
+            Response::LcWrite { req_id, username }
         },
     }
   }

@@ -2,7 +2,7 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::packet::{MessageType, RequestType, Response, ResponseType};
+use crate::packet::ResponseType;
 
 pub mod client;
 pub mod server;

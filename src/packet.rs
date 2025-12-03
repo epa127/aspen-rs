@@ -43,7 +43,7 @@ impl MessageType for RequestType {
     fn expected_len(&self) -> Option<usize> {
         match &self {
             RequestType::BeRead => None,
-            RequestType::LcRead => Some(size_of::<u64>()),
+            RequestType::LcRead => Some(2*size_of::<u64>()),
             RequestType::LcWrite => None,
         }
     }
@@ -53,35 +53,98 @@ impl MessageType for RequestType {
     }
 }
 
+struct MessageHeader {
+  kind: RequestType,
+  payload_len: usize,
+}
+
+impl MessageHeader {
+  fn expected_len() -> usize {
+    1 + LEN_LENGTH
+  }
+
+  fn len(&self) -> usize {
+    MessageHeader::expected_len()
+  }
+
+  fn deserialize(packet: &[u8]) -> Result<MessageHeader,ParseError> {
+    // Check for header (kind + Payload_len)
+    check_length(packet.len(), MessageHeader::expected_len())?;
+    
+    let kind = RequestType::from_value(packet[0])?;
+    let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
+    let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
+
+    // If request has a specific length, validate
+    if let Some(exp_len) = kind.expected_len() {
+      if exp_len != payload_len {
+        return Err(ParseError::UnexpectedLength { payload_len, exp_len });
+      }
+    }
+    Ok(MessageHeader {
+      kind, 
+      payload_len
+    })
+  }
+}
+
+struct PayloadHeader {
+  req_id: u64
+}
+
+impl PayloadHeader {
+  fn expected_len() -> usize {
+    LEN_LENGTH
+  }
+
+  fn len(&self) -> usize {
+    PayloadHeader::expected_len()
+  }
+
+  fn deserialize(payload: &[u8]) -> Result<PayloadHeader, ParseError> {
+    // payload should have at least the req_id bytes
+    check_length(payload.len(), PayloadHeader::expected_len());
+    let req_id_slice: [u8; 8] = payload[0..LEN_LENGTH].try_into().unwrap();
+    let req_id = u64::from_be_bytes(req_id_slice);
+    Ok(PayloadHeader { req_id })
+  }
+}
+
 #[derive(Clone, Debug)]
 pub enum Request {
   BeRead {
+    req_id: u64,
     substring: String
   },
   LcRead {
+    req_id: u64,
     id: u64
   },
   LcWrite {
+    req_id: u64,
     id: u64,
     username: String
   }
 }
 
 impl Request {
-  pub fn random(kind: RequestType) -> Request {
+  pub fn random(kind: RequestType, req_id: u64) -> Request {
     match kind {
         RequestType::BeRead => {
             Request::BeRead {
+              req_id,
               substring: Alphanumeric.sample_string(&mut rand::rng(), SUBSTRING_LEN) 
             }
           },
         RequestType::LcRead => {
             Request::LcRead { 
+              req_id,
               id: rand::rng().random_range(0..CAPACITY).try_into().unwrap()
             }
           }
         RequestType::LcWrite => {
             Request::LcWrite {
+                req_id,
                 id: rand::rng().random_range(0..CAPACITY).try_into().unwrap(),
                 username: Alphanumeric.sample_string(&mut rand::rng(), rand::rng().random_range(0..10).try_into().unwrap()),
             }
@@ -105,17 +168,21 @@ impl Message for Request {
     let mut packet: Vec<u8> = Vec::new();
     packet.push(self.kind().value());
     match self {
-      Request::BeRead { substring } => {
-        packet.extend_from_slice(&(substring.len() as u64).to_be_bytes());
-        packet.extend_from_slice(substring.as_bytes());
-      },
-      Request::LcRead { id } => {
-        let payload = id.to_be_bytes();
+      Request::BeRead { substring, req_id } => {
+        let mut payload: Vec<u8> = req_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(substring.as_bytes());
         packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         packet.extend_from_slice(&payload);
       },
-      Request::LcWrite { id, username } => {
-        let mut payload = id.to_be_bytes().to_vec();
+      Request::LcRead { req_id, id } => {
+        let mut payload: Vec<u8> = req_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(&id.to_be_bytes());
+        packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        packet.extend_from_slice(&payload);
+      },
+      Request::LcWrite { req_id, id, username } => {
+        let mut payload = req_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(&id.to_be_bytes());
         payload.extend_from_slice(username.as_bytes());
         packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         packet.extend_from_slice(&payload);
@@ -125,44 +192,31 @@ impl Message for Request {
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
-    let check_length = |len: usize, exp: usize| -> Result<(), ParseError> {
-      if len < exp {
-        return Err(ParseError::PacketTooShort);
-      } 
-      Ok(())
-    };
-
-    check_length(packet.len(), 1 + LEN_LENGTH)?;
+    let header = MessageHeader::deserialize(&packet)?;
     
-    let kind = RequestType::from_value(packet[0])?;
-    let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
-    let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
-
-    if let Some(exp_len) = kind.expected_len() {
-      if exp_len != payload_len {
-        return Err(ParseError::UnexpectedLength { payload_len, exp_len });
-      }
-    }
-
-    check_length(packet.len(), 1 + LEN_LENGTH + payload_len)?;
-    let payload = &packet[(LEN_LENGTH + 1)..(1 + LEN_LENGTH + payload_len)];
+    // Check for payload length
+    check_length(packet.len(), header.len() + header.payload_len)?;
+    let payload = &packet[header.len()..(header.len() + header.payload_len)];
+    let payload_header = PayloadHeader::deserialize(payload)?;
     
-    match kind {
+    let rest_payload = &payload[payload_header.len()..];
+    match header.kind {
         RequestType::BeRead => {
-          let str = String::from_utf8_lossy(payload).to_string();
-          Ok(Request::BeRead { substring: str })
+          check_length(rest_payload.len(), 1);
+          let str = String::from_utf8_lossy(rest_payload).to_string();
+          Ok(Request::BeRead { req_id: payload_header.req_id, substring: str })
         },
         RequestType::LcRead => {
-          let id = u64::from_be_bytes(payload.try_into().unwrap()); // byte check already done
-          Ok(Request::LcRead { id })
+          let id = u64::from_be_bytes(rest_payload.try_into().unwrap()); // byte check already done
+          Ok(Request::LcRead { req_id: payload_header.req_id, id })
         },
         RequestType::LcWrite => {
-          check_length(payload_len, LEN_LENGTH)?;
-          let id = u64::from_be_bytes(payload[0..LEN_LENGTH].try_into().unwrap());
+          check_length(rest_payload.len(), LEN_LENGTH + 1)?;
+          let id = u64::from_be_bytes(rest_payload[0..LEN_LENGTH].try_into().unwrap());
           
-          let uname_slice = &payload[LEN_LENGTH..payload_len];
+          let uname_slice = &rest_payload[LEN_LENGTH..];
           let username = String::from_utf8_lossy(uname_slice).to_string();
-          Ok(Request::LcWrite { id, username })
+          Ok(Request::LcWrite { req_id: payload_header.req_id, id, username })
         }
     }
   }
@@ -195,7 +249,7 @@ impl MessageType for ResponseType {
   
   fn expected_len(&self) -> Option<usize> {
       match &self {
-        ResponseType::BeRead => Some(size_of::<u64>()),
+        ResponseType::BeRead => Some(2*size_of::<u64>()),
         ResponseType::LcRead => None,
         ResponseType::LcWrite => None,
       }
@@ -219,12 +273,15 @@ impl ResponseType {
 #[derive(Clone, Debug)]
 pub enum Response {
   BeRead {
+    req_id: u64,
     freq: u64
   },
   LcRead {
+    req_id: u64,
     username: Option<String>
   },
   LcWrite {
+    req_id: u64,
     username: Option<String>
   }
 }
@@ -244,13 +301,15 @@ impl Message for Response {
     let mut packet: Vec<u8> = Vec::new();
     packet.push(self.kind().value());
     match self {
-      Response::BeRead { freq } => {
-        let payload = freq.to_be_bytes();
+      Response::BeRead { req_id, freq } => {
+        let mut payload = req_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(&freq.to_be_bytes());
+
         packet.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         packet.extend_from_slice(&payload);
       },
-      Response::LcRead { username } | Response::LcWrite { username } => {
-        let mut payload: Vec<u8> = Vec::new();
+      Response::LcRead { req_id, username } | Response::LcWrite { req_id, username } => {
+        let mut payload: Vec<u8> = req_id.to_be_bytes().to_vec();
         match username {
             Some(username) => {
               payload.push(SOME_BYTE);
@@ -268,43 +327,27 @@ impl Message for Response {
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
-    let check_length = |len: usize, exp: usize| -> Result<(), ParseError> {
-      if len < exp {
-        println!("BAD");
-        return Err(ParseError::PacketTooShort);
-      } 
-      Ok(())
-    };
-
-    const LEN_LENGTH: usize = size_of::<u64>();
-    check_length(packet.len(), 1 + LEN_LENGTH)?;
+    let header = MessageHeader::deserialize(&packet)?;
     
-    let kind = ResponseType::from_value(packet[0])?;
-    let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
-    let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
-
-    if let Some(exp_len) = kind.expected_len() {
-      if exp_len != payload_len {
-        println!("288");
-        return Err(ParseError::UnexpectedLength { payload_len, exp_len });
-      }
-    }
-
-    check_length(packet.len(), 1 + LEN_LENGTH + payload_len)?;
-    let payload = &packet[(LEN_LENGTH + 1)..(1 + LEN_LENGTH + payload_len)];
+    // Check for payload length
+    check_length(packet.len(), header.len() + header.payload_len)?;
+    let payload = &packet[header.len()..(header.len() + header.payload_len)];
+    let payload_header = PayloadHeader::deserialize(payload)?;
     
+    let rest_payload = &payload[payload_header.len()..];
+    let kind = ResponseType::from_request(header.kind);
     match kind {
       ResponseType::BeRead => {
-          let freq = u64::from_be_bytes(payload.try_into().unwrap()); // byte check already done
-          Ok(Response::BeRead { freq })
+          let freq = u64::from_be_bytes(rest_payload.try_into().unwrap()); // byte check already done
+          Ok(Response::BeRead { req_id: payload_header.req_id, freq })
         },
         ResponseType::LcRead | ResponseType::LcWrite => {
-          check_length(payload_len, 1)?;
+          check_length(rest_payload.len(), 2)?;
 
           let res = match payload[0] {
             NONE_BYTE => None,
             SOME_BYTE => {
-              let uname_slice = &payload[1..payload_len];
+              let uname_slice = &rest_payload[1..];
               let username = String::from_utf8_lossy(uname_slice).to_string();
               Some(username)
             },
@@ -312,11 +355,18 @@ impl Message for Response {
           };
 
           match kind {
-            ResponseType::LcRead => Ok(Response::LcRead { username: res }),
-            ResponseType::LcWrite => Ok(Response::LcWrite { username: res }),
+            ResponseType::LcRead => Ok(Response::LcRead { req_id: payload_header.req_id, username: res }),
+            ResponseType::LcWrite => Ok(Response::LcWrite { req_id: payload_header.req_id, username: res }),
             _ => panic!("this should be impossible")
           }
         },
     }
   }
+}
+
+fn check_length(len: usize, exp: usize) -> Result<(), ParseError> {
+  if len < exp {
+    return Err(ParseError::PacketTooShort);
+  } 
+  Ok(())
 }
