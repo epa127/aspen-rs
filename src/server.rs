@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
 use smol::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
-use crate::{BUF_LEN, LEN_LENGTH, packet::{Packet, PacketType, Request, RequestType, Response}, store::Store};
+use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, packet::{Message, MessageType, Request, RequestType, Response}, store::Store};
 
 
 use async_channel::unbounded;
@@ -32,7 +32,10 @@ impl DefaultSmolServer {
               let store = safe_store.clone();
               let (stream, addr) = listener.accept().await.unwrap();
               async fn worker(stream: TcpStream, addr: SocketAddr, store: Arc<Store>) {
-                Worker::new(stream, addr, store.clone()).run().await;
+                match Worker::new(stream, addr, store.clone()).run().await {
+                    Ok(_) | Err(AspenRsError::NetworkError(NetworkError::ConnectionReset)) => {},
+                    Err(e) => eprintln!("{e}"),
+                }
               }
               if i {
                 println!("Server accepted first connection at addr {:?}. Now spawning workers...", addr);
@@ -61,22 +64,22 @@ impl Worker {
     }
   }
 
-  async fn run(mut self) {
+  async fn run(mut self) -> Result<(), AspenRsError> {
     loop {
-      let req = self.receive_request().await.unwrap();
-      let res = self.execute_task(req).await.unwrap();
-      self.send_response(res).await.unwrap();
+      let req = self.receive_request().await?;
+      let res = self.execute_task(req).await;
+      self.send_response(res).await?;
     }
   }
   
-  async fn receive_request(&mut self) -> Result<Request, String> {
+  async fn receive_request(&mut self) -> Result<Request, AspenRsError> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; BUF_LEN];
     let mut req_type: Option<RequestType> = None;
     let mut expected_len: Option<usize> = None;
 
     loop {
-      let bytes_read = self.stream.read(&mut buf).await.map_err(|e| e.to_string())?;
+      let bytes_read = self.stream.read(&mut buf).await.map_err(|e| AspenRsError::NetworkError(NetworkError::from(e)))?;
       if bytes_read > 0 {
         read_buf.extend_from_slice(&buf[0..bytes_read]);
       } else {
@@ -92,7 +95,7 @@ impl Worker {
           continue;
         }
 
-        let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().map_err(|e: std::array::TryFromSliceError| e.to_string())?;
+        let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().unwrap();
         expected_len = Some(usize::from_be_bytes(len_arr));
       }
 
@@ -101,44 +104,34 @@ impl Worker {
       if read_buf.len() < total_exp_len {
         continue
       } else if read_buf.len() == total_exp_len {
-        return Request::deserialize(&read_buf);
+        return Request::deserialize(&read_buf).map_err(AspenRsError::ParseError);
       } else {
-        return Err(format!("Read more bytes than expected: {:?}", read_buf));
+        return Err(AspenRsError::ParseError(crate::ParseError::UnexpectedLength { payload_len: read_buf.len(), exp_len: total_exp_len }));
       }
     }
   }
 
-  async fn execute_task(&mut self, req: Request) -> Result<Response, String> {
+  async fn execute_task(&mut self, req: Request) -> Response {
     match req {
         Request::BeRead { substring } => {
             let freq: u64 = self.store.be_task(substring).await as u64;
-            Ok(Response::BeRead { freq })
+            Response::BeRead { freq }
           },
         Request::LcRead { id } => {
-            let id = id.try_into().map_err(|e: std::num::TryFromIntError| e.to_string())?;
+            let id = id.try_into().unwrap();
             let username = self.store.lc_read_task(id).await;
-            Ok(Response::LcRead { username })
+            Response::LcRead { username }
           },
         Request::LcWrite { id, username } => {
-            let id = id.try_into().map_err(|e: std::num::TryFromIntError| e.to_string())?;
+            let id = id.try_into().unwrap();
             let username = self.store.lc_write_task(id, username).await;
-            Ok(Response::LcWrite { username })
+            Response::LcWrite { username }
         },
     }
   }
 
-  async fn send_response(&mut self, res: Response) -> Result<(), String> {
+  async fn send_response(&mut self, res: Response) -> Result<(), AspenRsError> {
     let response = res.serialize();
-    let res_bytes = response.len();
-    let mut offset: usize = 0;
-
-    loop {
-      let bytes_written = self.stream.write(&response[offset..res_bytes]).await.map_err(|e| e.to_string())?;
-      if bytes_written == res_bytes {
-        return Ok(());
-      } else {
-        offset += bytes_written;
-      }
-    }
+    self.stream.write_all(&response).await.map_err(|e| AspenRsError::NetworkError(NetworkError::from(e)))
   }
 }

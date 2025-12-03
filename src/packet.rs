@@ -1,16 +1,16 @@
 use rand::{Rng, distr::{Alphanumeric, SampleString}};
-use crate::{BE_BYTE, CAPACITY, LC_READ_BYTE, LC_WRITE_BYTE, LEN_LENGTH, NONE_BYTE, SOME_BYTE, SUBSTRING_LEN};
+use crate::{BE_BYTE, CAPACITY, LC_READ_BYTE, LC_WRITE_BYTE, LEN_LENGTH, NONE_BYTE, ParseError, SOME_BYTE, SUBSTRING_LEN};
 
-pub trait Packet {
-  type Tag: PacketType;
+pub trait Message {
+  type Tag: MessageType;
   fn kind(&self) -> Self::Tag;
   fn serialize(&self) -> Vec<u8>;
-  fn deserialize(packet: &[u8]) -> Result<Self, String> where Self: std::marker::Sized;
+  fn deserialize(packet: &[u8]) -> Result<Self, ParseError> where Self: std::marker::Sized;
 }
 
-pub trait PacketType {
+pub trait MessageType {
   fn value(&self) -> u8;
-  fn from_value(value: u8) -> Result<Self, String> where Self: std::marker::Sized;
+  fn from_value(value: u8) -> Result<Self, ParseError> where Self: std::marker::Sized;
   fn expected_len(&self) -> Option<usize>;
   fn iterator() -> impl Iterator<Item = Self>;
 }
@@ -22,7 +22,7 @@ pub enum RequestType {
   LcWrite
 }
 
-impl PacketType for RequestType {
+impl MessageType for RequestType {
     fn value(&self) -> u8 {
         match &self {
             RequestType::BeRead => BE_BYTE,
@@ -31,12 +31,12 @@ impl PacketType for RequestType {
         }
     }
     
-    fn from_value(value: u8) -> Result<Self, String> where Self: std::marker::Sized {
+    fn from_value(value: u8) -> Result<Self, ParseError> where Self: std::marker::Sized {
         match value {
           BE_BYTE => Ok(RequestType::BeRead),
           LC_READ_BYTE => Ok(RequestType::LcRead),
           LC_WRITE_BYTE => Ok(RequestType::LcWrite),
-          _ => Err("Value is not attributed to a request type.".to_string())
+          _ => Err(ParseError::InvalidMessageType(value))
         }
     }
     
@@ -90,7 +90,7 @@ impl Request {
   }
 }
 
-impl Packet for Request {
+impl Message for Request {
   type Tag = RequestType;
 
   fn kind(&self) -> RequestType {
@@ -124,10 +124,10 @@ impl Packet for Request {
     packet
   }
 
-  fn deserialize(packet: &[u8]) -> Result<Self, String> {
-    let check_length = |len: usize, exp: usize| -> Result<(), String> {
+  fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
+    let check_length = |len: usize, exp: usize| -> Result<(), ParseError> {
       if len < exp {
-        return Err("Packet too short".to_string());
+        return Err(ParseError::PacketTooShort);
       } 
       Ok(())
     };
@@ -136,12 +136,11 @@ impl Packet for Request {
     
     let kind = RequestType::from_value(packet[0])?;
     let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
-    let payload_len: usize = u64::from_be_bytes(len).try_into()
-      .map_err(|_| "Payload length was larger than expected.".to_string())?;
+    let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
 
     if let Some(exp_len) = kind.expected_len() {
       if exp_len != payload_len {
-        return Err(format!("Payload len {payload_len} not equal to expected len {exp_len}").to_string());
+        return Err(ParseError::UnexpectedLength { payload_len, exp_len });
       }
     }
 
@@ -176,7 +175,7 @@ pub enum ResponseType {
   LcWrite
 }
 
-impl PacketType for ResponseType {
+impl MessageType for ResponseType {
   fn value(&self) -> u8 {
       match &self {
           ResponseType::BeRead => BE_BYTE,
@@ -185,12 +184,12 @@ impl PacketType for ResponseType {
       }
   }
   
-  fn from_value(value: u8) -> Result<Self, String> where Self: std::marker::Sized {
+  fn from_value(value: u8) -> Result<Self, ParseError> where Self: std::marker::Sized {
       match value {
         BE_BYTE => Ok(ResponseType::BeRead),
         LC_READ_BYTE => Ok(ResponseType::LcRead),
         LC_WRITE_BYTE => Ok(ResponseType::LcWrite),
-        _ => Err("Value is not attributed to a request type.".to_string())
+        _ => Err(ParseError::InvalidMessageType(value))
       }
   }
   
@@ -230,7 +229,7 @@ pub enum Response {
   }
 }
 
-impl Packet for Response {
+impl Message for Response {
   type Tag = ResponseType;
 
   fn kind(&self) -> ResponseType {
@@ -268,11 +267,11 @@ impl Packet for Response {
     packet
   }
 
-  fn deserialize(packet: &[u8]) -> Result<Self, String> {
-    let check_length = |len: usize, exp: usize| -> Result<(), String> {
+  fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
+    let check_length = |len: usize, exp: usize| -> Result<(), ParseError> {
       if len < exp {
         println!("BAD");
-        return Err("Packet too short".to_string());
+        return Err(ParseError::PacketTooShort);
       } 
       Ok(())
     };
@@ -280,14 +279,14 @@ impl Packet for Response {
     const LEN_LENGTH: usize = size_of::<u64>();
     check_length(packet.len(), 1 + LEN_LENGTH)?;
     
-    let kind = RequestType::from_value(packet[0])?;
+    let kind = ResponseType::from_value(packet[0])?;
     let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
-    let payload_len: usize = u64::from_be_bytes(len).try_into()
-      .map_err(|_| "Payload length was larger than expected.".to_string())?;
+    let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
 
     if let Some(exp_len) = kind.expected_len() {
       if exp_len != payload_len {
-        return Err(format!("Payload len {payload_len} not equal to expected len {exp_len}").to_string());
+        println!("288");
+        return Err(ParseError::UnexpectedLength { payload_len, exp_len });
       }
     }
 
@@ -295,11 +294,11 @@ impl Packet for Response {
     let payload = &packet[(LEN_LENGTH + 1)..(1 + LEN_LENGTH + payload_len)];
     
     match kind {
-      RequestType::BeRead => {
+      ResponseType::BeRead => {
           let freq = u64::from_be_bytes(payload.try_into().unwrap()); // byte check already done
           Ok(Response::BeRead { freq })
         },
-        RequestType::LcRead | RequestType::LcWrite => {
+        ResponseType::LcRead | ResponseType::LcWrite => {
           check_length(payload_len, 1)?;
 
           let res = match payload[0] {
@@ -309,13 +308,13 @@ impl Packet for Response {
               let username = String::from_utf8_lossy(uname_slice).to_string();
               Some(username)
             },
-            _ => {return Err("Unexpected byte in payload".to_string());}
+            _ => {return Err(ParseError::UnexpectedOptionType(payload[0]));}
           };
 
           match kind {
-            RequestType::LcRead => Ok(Response::LcRead { username: res }),
-            RequestType::LcWrite => Ok(Response::LcWrite { username: res }),
-            _ => Err("Impossible match arm".to_string())
+            ResponseType::LcRead => Ok(Response::LcRead { username: res }),
+            ResponseType::LcWrite => Ok(Response::LcWrite { username: res }),
+            _ => panic!("this should be impossible")
           }
         },
     }

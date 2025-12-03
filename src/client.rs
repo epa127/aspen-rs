@@ -1,8 +1,8 @@
-use std::{collections::HashMap, fs::{self, File}, io::{Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
+use std::{collections::HashMap, fs::{self, File}, io::{ErrorKind, Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
 use hdrhistogram::Histogram;
 use rand::Rng;
 
-use crate::{BUF_LEN, LEN_LENGTH, SIG_FIG, packet::{Packet, PacketType, Request, RequestType, Response, ResponseType}};
+use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, ParseError, SIG_FIG, packet::{Message, MessageType, Request, RequestType, Response, ResponseType}};
 
 #[derive(Debug)]
 pub struct Client {
@@ -81,7 +81,7 @@ impl Client {
 
   fn general_results(&self, total_secs: f32, stat_map: &HashMap<ResponseType, Histogram<u64>>) {
     let datetime = chrono::offset::Local::now();
-    let header = format!("--- BENCHMARK TEST: {datetime} ---\n");
+    let header = format!("--- CLOSED-LOOP BENCHMARK TEST: {datetime} ---\n");
     
     let setup = format!("SETUP:\n    THREADS: {},\n    CONNECTIONS PER THREAD: {},\n    NUM TASKS: {}\n    BE:LC RATIO: {}\n    LC WRITE:READ RATIO: {}\n\n",
         self.num_threads, self.conns_per_thr, self.workload, self.be_lc_ratio, self.lc_write_read_ratio);
@@ -188,147 +188,181 @@ impl ClientThread {
     }
   }
 
-  fn send_packets(mut self) -> Result<Self, String> {
+  fn generate_random_request(&self) -> Request {
+    let be_rat: f32 = rand::rng().random();
+    let wr_rat: f32 = rand::rng().random();
+    if be_rat <= self.be_prob {
+      Request::random(RequestType::BeRead)
+    } else if wr_rat <= self.wr_lc_prob {
+      Request::random(RequestType::LcWrite)
+    } else {
+      Request::random(RequestType::LcRead)
+    }
+  }
+
+  fn send_packets(mut self) -> Result<Self, AspenRsError> {
     let mut tasks_pending: usize = 0;
+    let mut i = 0;
     while self.remaining_work > 0 || tasks_pending > 0 {
-      let i = rand::rng().random_range(0..self.conns_per_thr);
-      let conn = self.connections.get_mut(i).expect("Connection should exist.");
+      
       // println!("Chose connection at {} with status {:?}", conn.stream.local_addr().unwrap().port(), conn.status);
-      match conn.status.kind() {
-        ConnStateType::Ready => {
-          if self.remaining_work > 0 {
-            let be_rat: f32 = rand::rng().random();
-            let wr_rat: f32 = rand::rng().random();
-            let req = if be_rat <= self.be_prob {
-              Request::random(RequestType::BeRead)
-            } else if wr_rat <= self.wr_lc_prob {
-              Request::random(RequestType::LcWrite)
-            } else {
-              Request::random(RequestType::LcRead)
-            };
-            conn.send_initial_request(req)?;
-            self.remaining_work -= 1;
-            tasks_pending += 1;
-          }
-        },
-        ConnStateType::WritingRequest => {
-          conn.resend_request()?;
-        },
-        ConnStateType::ReadingResponse => {
-          if let Some((res_type, latency)) = conn.try_read()? {
-            self.latencies.get_mut(&res_type).unwrap().push(latency);
+      let req = {
+        let conn = &self.connections[i];
+        if conn.status.kind() == ConnStateType::Ready && self.remaining_work > 0 {
+          self.remaining_work -= 1;
+          Some(self.generate_random_request())
+        } else {
+          None
+        }
+      };
+
+      let conn = &mut self.connections[i];
+
+      match conn.progress(req)? {
+        Progress::CompletedResponse(res_type, latency) => {
+          self.latencies.get_mut(&res_type).unwrap().push(latency);
+          tasks_pending -= 1;
+        }
+        Progress::ConnectionReset(in_flight) => {
+          conn.reconnect()?;
+          // if the connection was in-flight, adjust tasks_pending?
+          if in_flight {
             tasks_pending -= 1;
           }
+        },
+        Progress::SentRequest => {
+          tasks_pending += 1;
         }
+        _ => {},
       }
+      i = (i + 1) % self.conns_per_thr;
     }
     Ok(self)
   }
 }
 
+pub enum Progress {
+  WouldBlock,
+  MadeProgress,
+  SentRequest,
+  CompletedResponse(ResponseType, u128),
+  ConnectionReset(bool), // in flight?
+  Idle
+}
 struct Connection {
   stream: TcpStream,
   status: ConnectionStatus
 }
 
 impl Connection {
-  fn new(addr: &str) -> Result<Self, String> {
-    match TcpStream::connect(addr) {
-      Ok(stream) => { Ok(Connection { 
-              stream, 
-              status: ConnectionStatus::Ready 
-            })}
-      Err(e) => Err(e.to_string())
-    }
+  fn new(addr: &str) -> Result<Self, NetworkError> {
+    let stream = TcpStream::connect(addr)?;
+    stream.set_nonblocking(true)?;
+    Ok(Connection { 
+      stream, 
+      status: ConnectionStatus::Ready 
+    })
   }
 
-  fn send_initial_request(&mut self, req: Request) -> Result<(), String> {
-    // println!("Sending {:?} from {}", req.kind(), self.stream.local_addr().unwrap().port());
-    let request= req.serialize();
-    let req_bytes = request.len();
-    let start_time = Instant::now();
-    let bytes_written = self.stream.write(&request).map_err(|e| e.to_string())?;
-    self.status = if bytes_written == req_bytes {
-      // println!("Request sent to {}", self.stream.local_addr().unwrap());
-      ConnectionStatus::ReadingResponse { 
-        exp_type: ResponseType::from_request(req.kind()), 
-        start_time, 
-        read_buf: Vec::new(), 
-        expected_len: None 
-      }
-    } else {
-      ConnectionStatus::WritingRequest { 
-        req: req.kind(), 
-        start_time, 
-        write_buf: request, 
-        offset: bytes_written 
-      }
-    };
+  fn reconnect(&mut self) -> Result<(), NetworkError> {
+    let stream = TcpStream::connect(self.stream.local_addr()?)?;
+    stream.set_nonblocking(true)?;
+    self.stream = stream;
+    self.status = ConnectionStatus::Ready;
     Ok(())
   }
 
-  fn resend_request(&mut self) -> Result<(), String> {
-    if let ConnectionStatus::WritingRequest { req, start_time, write_buf, offset } = &mut self.status {
-      // println!("Resending {:?} from {}", req, self.stream.local_addr().unwrap().port());
-      let req_bytes = write_buf.len();
-      let bytes_written = self.stream.write(&write_buf[*offset..req_bytes]).map_err(|e| e.to_string())?;
-      if bytes_written == req_bytes {
-        self.status = ConnectionStatus::ReadingResponse { 
-          exp_type: ResponseType::from_request(*req), 
-          start_time: *start_time, 
-          read_buf: Vec::new(), 
-          expected_len: None 
-        };
-      } else {
-        *offset += bytes_written;
-      }
-      return Ok(());
+  fn progress(&mut self, req: Option<Request>) -> Result<Progress, AspenRsError> {
+    match &mut self.status {
+        ConnectionStatus::Ready => {
+          match req {
+            Some(req) => {
+              self.status = ConnectionStatus::WritingRequest { 
+                req: req.kind(), 
+                start_time: None, 
+                write_buf: req.serialize(), 
+                offset: 0 
+              };
+              Ok(Progress::MadeProgress)
+            },
+            None => Ok(Progress::Idle), 
+          }
+        },
+        ConnectionStatus::WritingRequest { req, start_time, write_buf, offset } => {
+          let req_bytes = write_buf.len();
+          match self.stream.write(&write_buf[*offset..req_bytes]) {
+            Ok(bytes_written) => {
+              let was_started = start_time.is_some();
+              if !was_started {
+                  *start_time = Some(Instant::now());
+              }
+              if bytes_written == req_bytes {
+                self.status = ConnectionStatus::ReadingResponse { 
+                  exp_type: ResponseType::from_request(*req), 
+                  start_time: (*start_time).unwrap(), 
+                  read_buf: Vec::new(), 
+                  expected_len: None  
+                };
+              } else {
+                *offset += bytes_written;
+              }
+              if was_started {
+                return Ok(Progress::MadeProgress);
+              }
+              Ok(Progress::SentRequest)
+            },
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(Progress::WouldBlock),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => Ok(Progress::ConnectionReset(start_time.is_some())),
+            Err(e) => Err(AspenRsError::NetworkError(NetworkError::from(e)))
+          }
+        },
+        ConnectionStatus::ReadingResponse { exp_type, start_time, read_buf, expected_len } => {
+          let mut buf = [0; BUF_LEN];
+          let check_type = read_buf.is_empty();
+          match self.stream.read(&mut buf) {
+            Ok(bytes_read) => {
+              if bytes_read > 0 {
+                read_buf.extend_from_slice(&buf[0..bytes_read]);
+              } else {
+                return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
+              }
+    
+              let packet_type = ResponseType::from_value(*read_buf.first().unwrap())?;
+              if check_type && *exp_type != packet_type {
+                return Err(AspenRsError::ParseError(ParseError::UnexpectedMessageType{ exp_type: *exp_type, given_type: packet_type }));
+              }
+    
+              if expected_len.is_none() {
+                if read_buf.len() < (1 + LEN_LENGTH) {
+                  return Ok(Progress::MadeProgress);
+                }
+    
+                let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().unwrap();
+                *expected_len = Some(usize::from_be_bytes(len_arr));
+              }
+    
+              let total_exp_len = 1 + LEN_LENGTH + expected_len.expect("Should not be None based on previous checks");
+    
+              if read_buf.len() < total_exp_len {
+                Ok(Progress::MadeProgress)
+              } else if read_buf.len() == total_exp_len {
+                let _res = Response::deserialize(read_buf).map_err(AspenRsError::ParseError)?;
+                // optional check for response
+                let latency = start_time.elapsed().as_micros();
+                self.status = ConnectionStatus::Ready;
+                // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
+                return Ok(Progress::CompletedResponse(packet_type, latency));
+              } else {
+                println!("HERHE");
+                return Err(AspenRsError::ParseError(ParseError::UnexpectedLength { payload_len: read_buf.len(), exp_len: total_exp_len }));
+              }
+            },
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(Progress::WouldBlock),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => Ok(Progress::ConnectionReset(true)),
+            Err(e) => Err(AspenRsError::NetworkError(NetworkError::from(e)))
+          }   
+        },
     }
-    Err("Resend request was called with an invalid connection status.".to_string())
-  }
-
-  /// Returns Ok(Some((RequestType, latency)) if read is complete, Ok(None) for a partial read, and Errs otherwise.
-  fn try_read(&mut self) -> Result<Option<(ResponseType, u128)>, String> {
-    if let ConnectionStatus::ReadingResponse { exp_type, start_time, read_buf, expected_len } = &mut self.status {
-      let mut buf = [0; BUF_LEN];
-      let check_type = read_buf.is_empty();
-      let bytes_read = self.stream.read(&mut buf).map_err(|e| e.to_string())?;
-      if bytes_read > 0 {
-        read_buf.extend_from_slice(&buf[0..bytes_read]);
-      } else {
-        return Ok(None);
-      }
-
-      let packet_type = ResponseType::from_value(*read_buf.first().unwrap())?;
-      if check_type && *exp_type != packet_type {
-        return Err("Connection received packet of unexpected type.".to_string());
-      }
-
-      if expected_len.is_none() {
-        if read_buf.len() < (1 + LEN_LENGTH) {
-          return Ok(None);
-        }
-
-        let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().map_err(|e: std::array::TryFromSliceError| e.to_string())?;
-        *expected_len = Some(usize::from_be_bytes(len_arr));
-      }
-
-      let total_exp_len = 1 + LEN_LENGTH + expected_len.expect("Should not be None based on previous checks");
-      
-      if read_buf.len() < total_exp_len {
-        return Ok(None);
-      } else if read_buf.len() == total_exp_len {
-        let _res = Response::deserialize(read_buf);
-        // optional check for response
-        let latency = start_time.elapsed().as_micros();
-        self.status = ConnectionStatus::Ready;
-        // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
-        return Ok(Some((packet_type, latency)));
-      } else {
-        return Err(format!("Read more bytes than expected: {:?}", read_buf));
-      }
-    }
-    Err("try_read() was called on a connection with invalid status.".to_string())
   }
 }
 
@@ -337,7 +371,7 @@ enum ConnectionStatus {
   Ready,
   WritingRequest {
       req: RequestType,
-      start_time: Instant,
+      start_time: Option<Instant>,
       write_buf: Vec<u8>,
       offset: usize, // start writing at this value
   },
@@ -359,6 +393,7 @@ impl ConnectionStatus {
   }
 }
 
+#[derive(PartialEq, Eq)]
 enum ConnStateType {
   Ready,
   WritingRequest,
