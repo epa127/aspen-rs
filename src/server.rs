@@ -1,5 +1,5 @@
 use std::{net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
-use smol::{fs::read, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use smol::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, packet::{Message, MessageType, Request, RequestType, Response}, store::Store};
 
 
