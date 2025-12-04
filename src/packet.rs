@@ -84,7 +84,6 @@ impl<T: MessageType> Header for MessageHeader<T> {
   fn deserialize(packet: &[u8]) -> Result<MessageHeader<T>,ParseError> {
     // Check for header (kind + Payload_len)
     check_length(packet.len(), MessageHeader::<T>::expected_len())?;
-    
     let kind = T::from_value(packet[0])?;
     let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
     let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
@@ -209,7 +208,9 @@ impl Message for Request {
       },
       Request::LcWrite { req_id, id, username } => {
         let mut payload: Vec<u8> = PayloadHeader::new(*req_id).serialize();
+        assert!(payload.len() == 8);
         payload.extend_from_slice(&id.to_be_bytes());
+        assert!(payload.len() == 16);
         payload.extend_from_slice(username.as_bytes());
         payload
       }
@@ -239,11 +240,16 @@ impl Message for Request {
           Ok(Request::LcRead { req_id: payload_header.req_id, id })
         },
         RequestType::LcWrite => {
-          check_length(rest_payload.len(), LEN_LENGTH + 1)?;
+          check_length(rest_payload.len(), LEN_LENGTH)?;
           let id = u64::from_be_bytes(rest_payload[0..LEN_LENGTH].try_into().unwrap());
           
-          let uname_slice = &rest_payload[LEN_LENGTH..];
-          let username = String::from_utf8_lossy(uname_slice).to_string();
+          let username = if rest_payload.len() == LEN_LENGTH {
+            "".to_string()
+          } else {
+            let uname_slice = &rest_payload[LEN_LENGTH..];
+            String::from_utf8_lossy(uname_slice).to_string()
+          };
+          
           Ok(Request::LcWrite { req_id: payload_header.req_id, id, username })
         }
     }
@@ -353,7 +359,7 @@ impl Message for Response {
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
-    let header = MessageHeader::deserialize(packet)?;
+    let header: MessageHeader<ResponseType> = MessageHeader::deserialize(packet)?;
     
     // Check for payload length
     check_length(packet.len(), header.len() + header.payload_len)?;
@@ -361,20 +367,23 @@ impl Message for Response {
     let payload_header = PayloadHeader::deserialize(payload)?;
     
     let rest_payload = &payload[payload_header.len()..];
-    let kind = ResponseType::from_request(header.kind);
+    let kind = header.kind;
     match kind {
       ResponseType::BeRead => {
           let freq = u64::from_be_bytes(rest_payload.try_into().unwrap()); // byte check already done
           Ok(Response::BeRead { req_id: payload_header.req_id, freq })
         },
         ResponseType::LcRead | ResponseType::LcWrite => {
-          check_length(rest_payload.len(), 2)?;
-
+          check_length(rest_payload.len(), 1)?;
           let res = match payload[0] {
             NONE_BYTE => None,
             SOME_BYTE => {
-              let uname_slice = &rest_payload[1..];
-              let username = String::from_utf8_lossy(uname_slice).to_string();
+              let username = if rest_payload.len() == 1 {
+                "".to_string()
+              } else {
+                let uname_slice = &rest_payload[1..];
+                String::from_utf8_lossy(uname_slice).to_string()
+              };
               Some(username)
             },
             _ => {return Err(ParseError::UnexpectedOptionType(payload[0]));}

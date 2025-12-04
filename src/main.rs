@@ -12,7 +12,7 @@ fn main() {
     println!("Successfully created database with {} keys.", store_len);
 
     let num_threads = num_cpus::get();
-    let client_threads: usize = 3;
+    let client_threads: usize = 1;
     let server_threads = num_threads - client_threads;
     thread::spawn(move || {
         server::DefaultSmolServer::init(server_threads, port, tx, store);
@@ -22,6 +22,6 @@ fn main() {
 
     println!("Starting main client thread...");
     
-    client::Client::new(25000, 0.0001, 0.1, client_threads, 256).run(port);
+    client::Client::new(25000, 0.0001, 0.1, client_threads, 1).run(port);
 }
 

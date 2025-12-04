@@ -358,7 +358,6 @@ impl Connection {
                 // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
                 return Ok(Progress::CompletedResponse(packet_type, latency));
               } else {
-                println!("HERHE");
                 return Err(AspenRsError::ParseError(ParseError::UnexpectedLength { payload_len: read_buf.len(), exp_len: total_exp_len }));
               }
             },

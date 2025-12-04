@@ -10,13 +10,12 @@
 
 1. ~~Add `ECONNRESET` error handling~~
 2. ~~Add `RequestID` to packets~~
-3. Add error packet type
-4. Lua packet dissector
-5. Implement Open Loop
+3. Implement Open Loop
     * Client
         1. Sending thread (with timer)
         2. Receiving thread
         3. Results
     * Server
         1. Packet queues, with drops
-6. Multithreaded client support (multiple senders and receivers?)
+4. Multithreaded client support (multiple senders and receivers?)
+5. Lua packet dissector
