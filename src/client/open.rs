@@ -404,7 +404,7 @@ impl Connection {
                 let _res = Response::deserialize(read_buf).map_err(AspenRsError::ParseError)?;
                 // optional check for response
                 let latency = start_time.elapsed().as_micros();
-                self.latencies.get_mut(&res_type).unwrap().push(latency);
+                self.latencies.get_mut(res_type).unwrap().push(latency);
                 self.read_queue.pop_front().unwrap();
                 // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
               } else {
@@ -458,17 +458,4 @@ impl RequestState {
       offset: 0
     }
   }
-
-  fn kind(&self) -> RequestStateType {
-    match &self {
-        RequestState::Writing { .. } => RequestStateType::Writing,
-        RequestState::Reading { .. } => RequestStateType::Reading,
-    }
-  }
-}
-
-#[derive(PartialEq, Eq)]
-enum RequestStateType {
-  Writing,
-  Reading
 }
