@@ -5,7 +5,7 @@ use rand::Rng;
 use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, ParseError, SIG_FIG, packet::{Message, MessageType, Request, RequestType, Response, ResponseType}};
 
 #[derive(Debug)]
-pub struct Client {
+pub struct ClosedBench {
   be_lc_ratio: f32,
   conns_per_thr: usize,
   lc_write_read_ratio: f32,
@@ -13,9 +13,9 @@ pub struct Client {
   workload: usize,
 }
 
-impl Client {
+impl ClosedBench {
   pub fn new(workload: usize, be_lc_ratio: f32, lc_write_read_ratio: f32, num_threads: usize, conns_per_thr: usize) -> Self {
-    Client { 
+    ClosedBench { 
       be_lc_ratio,
       conns_per_thr,
       lc_write_read_ratio,
@@ -160,7 +160,6 @@ impl Client {
 }
 
 struct ClientThread {
-  conns_per_thr: usize,
   connections: Vec<Connection>,
   latencies: HashMap<ResponseType, Vec<u128>>,
   remaining_work: usize,
@@ -182,7 +181,6 @@ impl ClientThread {
     }
 
     ClientThread {
-      conns_per_thr,
       connections: conns,
       latencies,
       remaining_work: workload,
@@ -209,11 +207,12 @@ impl ClientThread {
   fn send_packets(mut self) -> Result<Self, AspenRsError> {
     let mut tasks_pending: usize = 0;
     let mut i = 0;
+    let num_conns = self.connections.len();
     while self.remaining_work > 0 || tasks_pending > 0 {
       
       // println!("Chose connection at {} with status {:?}", conn.stream.local_addr().unwrap().port(), conn.status);
       let req = {
-        let conn = &self.connections[i];
+        let conn = &mut self.connections[i];
         if conn.status.kind() == ConnStateType::Ready && self.remaining_work > 0 {
           self.remaining_work -= 1;
           Some(self.generate_random_request())
@@ -240,7 +239,7 @@ impl ClientThread {
         }
         _ => {},
       }
-      i = (i + 1) % self.conns_per_thr;
+      i = (i + 1) % num_conns;
     }
     Ok(self)
   }
@@ -301,7 +300,7 @@ impl Connection {
               if !was_started {
                   *start_time = Some(Instant::now());
               }
-              if bytes_written == req_bytes {
+              if bytes_written + *offset == req_bytes {
                 self.status = ConnectionStatus::ReadingResponse { 
                   exp_type: ResponseType::from_request(*req), 
                   start_time: (*start_time).unwrap(), 
@@ -333,6 +332,8 @@ impl Connection {
               }
     
               let packet_type = ResponseType::from_value(*read_buf.first().unwrap())?;
+              
+              // TODO: Add Drop packet handling
               if check_type && *exp_type != packet_type {
                 return Err(AspenRsError::ParseError(ParseError::UnexpectedMessageType{ exp_type: *exp_type, given_type: packet_type }));
               }

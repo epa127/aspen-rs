@@ -1,21 +1,13 @@
-### Things to add
-
-1. Add open-loop tail latency benchmarks
-    * Open-loop client and open-loop server
-    * Server needs an explicit queue
-    * Client needs sender, receiver, and timing threads
-    * Server and client needs to handle disconnections
-
 ### TODO LIST
 
 1. ~~Add `ECONNRESET` error handling~~
 2. ~~Add `RequestID` to packets~~
-3. Implement Open Loop
-    * Client
-        1. Sending thread (with timer)
-        2. Receiving thread
-        3. Results
-    * Server
-        1. Packet queues, with drops
-4. Multithreaded client support (multiple senders and receivers?)
-5. Lua packet dissector
+3. ~~Lua packet dissector~~
+
+Implement Open Loop:
+
+4. ~~Open loop client, spin polling connections~~
+5. Server that can handle open loop clients, namely:
+    * Has bounded packet queues
+    * Drop responses
+6. Client that uses Linux `epoll`

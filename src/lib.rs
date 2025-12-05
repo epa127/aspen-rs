@@ -26,7 +26,9 @@ pub enum AspenRsError {
   #[error("network error: {0}")]
   NetworkError(#[from] NetworkError),
   #[error("parse error: {0}")]
-  ParseError(#[from] ParseError)
+  ParseError(#[from] ParseError),
+  #[error("internal error: {0}")]
+  InternalError(String)
 }
 
 #[derive(Debug, Error)]

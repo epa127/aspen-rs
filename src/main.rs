@@ -1,6 +1,6 @@
 use std::{sync::mpsc, thread};
 
-use aspen_rust::{client, server, store::Store};
+use aspen_rust::{client::{closed, open}, server, store::Store};
 
 fn main() {
     println!("Starting benchmark...");
@@ -12,7 +12,7 @@ fn main() {
     println!("Successfully created database with {} keys.", store_len);
 
     let num_threads = num_cpus::get();
-    let client_threads: usize = 1;
+    let client_threads: usize = 3;
     let server_threads = num_threads - client_threads;
     thread::spawn(move || {
         server::DefaultSmolServer::init(server_threads, port, tx, store);
@@ -22,6 +22,13 @@ fn main() {
 
     println!("Starting main client thread...");
     
-    client::Client::new(25000, 0.0001, 0.1, client_threads, 1).run(port);
+    // closed::ClosedBench::new(2500, 0.001, 0.1, client_threads, 64).run(port);
+    open::OpenBench::new(
+        2500, 
+        10.0,
+        0.001, 
+        0.1, 
+        client_threads,
+        64).run(port);
 }
 
