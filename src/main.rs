@@ -22,13 +22,13 @@ fn main() {
 
     println!("Starting main client thread...");
     
-    // closed::ClosedBench::new(2500, 0.001, 0.1, client_threads, 64).run(port);
-    open::OpenBench::new(
-        2500, 
-        10.0,
-        0.001, 
-        0.1, 
-        client_threads,
-        64).run(port);
+    closed::ClosedBench::new(2500, 0.001, 0.1, client_threads, 64).run(port);
+    // open::OpenBench::new(
+    //     2500, 
+    //     10.0,
+    //     0.001, 
+    //     0.1, 
+    //     client_threads,
+    //     64).run(port);
 }
 

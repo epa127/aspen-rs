@@ -1,5 +1,5 @@
 use rand::{Rng, distr::{Alphanumeric, SampleString}};
-use crate::{BE_BYTE, CAPACITY, LC_READ_BYTE, LC_WRITE_BYTE, LEN_LENGTH, NONE_BYTE, ParseError, SOME_BYTE, SUBSTRING_LEN};
+use crate::{BE_BYTE, CAPACITY, DROP_BYTE, LC_READ_BYTE, LC_WRITE_BYTE, LEN_LENGTH, NONE_BYTE, ParseError, SOME_BYTE, SUBSTRING_LEN};
 
 pub trait Message {
   type Tag: MessageType;
@@ -208,9 +208,7 @@ impl Message for Request {
       },
       Request::LcWrite { req_id, id, username } => {
         let mut payload: Vec<u8> = PayloadHeader::new(*req_id).serialize();
-        assert!(payload.len() == 8);
         payload.extend_from_slice(&id.to_be_bytes());
-        assert!(payload.len() == 16);
         payload.extend_from_slice(username.as_bytes());
         payload
       }
@@ -260,7 +258,8 @@ impl Message for Request {
 pub enum ResponseType {
   BeRead,
   LcRead,
-  LcWrite
+  LcWrite,
+  Drop
 }
 
 impl MessageType for ResponseType {
@@ -269,11 +268,13 @@ impl MessageType for ResponseType {
           ResponseType::BeRead => BE_BYTE,
           ResponseType::LcRead => LC_READ_BYTE,
           ResponseType::LcWrite => LC_WRITE_BYTE,
+          ResponseType::Drop => DROP_BYTE,
       }
   }
   
   fn from_value(value: u8) -> Result<Self, ParseError> where Self: std::marker::Sized {
       match value {
+        DROP_BYTE => Ok(ResponseType::Drop),
         BE_BYTE => Ok(ResponseType::BeRead),
         LC_READ_BYTE => Ok(ResponseType::LcRead),
         LC_WRITE_BYTE => Ok(ResponseType::LcWrite),
@@ -286,6 +287,7 @@ impl MessageType for ResponseType {
         ResponseType::BeRead => Some(2*size_of::<u64>()),
         ResponseType::LcRead => None,
         ResponseType::LcWrite => None,
+        ResponseType::Drop => todo!(),
       }
   }
 
@@ -317,6 +319,9 @@ pub enum Response {
   LcWrite {
     req_id: u64,
     username: Option<String>
+  },
+  Drop {
+    req_id: u64
   }
 }
 
@@ -328,6 +333,7 @@ impl Message for Response {
         Response::BeRead { .. } => ResponseType::BeRead,
         Response::LcRead { .. } => ResponseType::LcRead,
         Response::LcWrite { .. } => ResponseType::LcWrite,
+        Response::Drop { .. } => ResponseType::Drop,
       }
   }
 
@@ -351,6 +357,9 @@ impl Message for Response {
             },
         }
         payload
+      },
+      Response::Drop { req_id } => {
+        PayloadHeader::new(*req_id).serialize()
       }
     };
     let mut packet = MessageHeader::new(self.kind(), payload.len()).serialize();
@@ -370,31 +379,34 @@ impl Message for Response {
     let kind = header.kind;
     match kind {
       ResponseType::BeRead => {
-          let freq = u64::from_be_bytes(rest_payload.try_into().unwrap()); // byte check already done
-          Ok(Response::BeRead { req_id: payload_header.req_id, freq })
-        },
-        ResponseType::LcRead | ResponseType::LcWrite => {
-          check_length(rest_payload.len(), 1)?;
-          let res = match payload[0] {
-            NONE_BYTE => None,
-            SOME_BYTE => {
-              let username = if rest_payload.len() == 1 {
-                "".to_string()
-              } else {
-                let uname_slice = &rest_payload[1..];
-                String::from_utf8_lossy(uname_slice).to_string()
-              };
-              Some(username)
-            },
-            _ => {return Err(ParseError::UnexpectedOptionType(payload[0]));}
-          };
+        let freq = u64::from_be_bytes(rest_payload.try_into().unwrap()); // byte check already done
+        Ok(Response::BeRead { req_id: payload_header.req_id, freq })
+      },
+      ResponseType::LcRead | ResponseType::LcWrite => {
+        check_length(rest_payload.len(), 1)?;
+        let res = match payload[0] {
+          NONE_BYTE => None,
+          SOME_BYTE => {
+            let username = if rest_payload.len() == 1 {
+              "".to_string()
+            } else {
+              let uname_slice = &rest_payload[1..];
+              String::from_utf8_lossy(uname_slice).to_string()
+            };
+            Some(username)
+          },
+          _ => {return Err(ParseError::UnexpectedOptionType(payload[0]));}
+        };
 
-          match kind {
-            ResponseType::LcRead => Ok(Response::LcRead { req_id: payload_header.req_id, username: res }),
-            ResponseType::LcWrite => Ok(Response::LcWrite { req_id: payload_header.req_id, username: res }),
-            _ => panic!("this should be impossible")
-          }
-        },
+        match kind {
+          ResponseType::LcRead => Ok(Response::LcRead { req_id: payload_header.req_id, username: res }),
+          ResponseType::LcWrite => Ok(Response::LcWrite { req_id: payload_header.req_id, username: res }),
+          _ => panic!("this should be impossible")
+        }
+      },
+      ResponseType::Drop => {
+        Ok(Response::Drop { req_id: payload_header.req_id })
+      }
     }
   }
 }

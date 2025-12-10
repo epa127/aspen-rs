@@ -3,7 +3,7 @@ use std::{collections::{HashMap, VecDeque}, fs::{self, File}, io::{ErrorKind, Re
 use hdrhistogram::Histogram;
 use rand::Rng;
 use rand_distr::{Distribution, Exp};
-use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, ParseError, SIG_FIG, packet::{Message, MessageType, Request, RequestType, Response, ResponseType}};
+use crate::{AspenRsError, BUF_LEN, NetworkError, ParseError, SIG_FIG, frame::{ReadFrame, WriteFrame, WriteProgress}, packet::{Message, MessageType, Request, RequestType, Response, ResponseType}};
 
 
 pub struct OpenBench {
@@ -148,6 +148,7 @@ impl OpenBench {
         ResponseType::BeRead => "beread",
         ResponseType::LcRead => "lcread",
         ResponseType::LcWrite => "lcwrite",
+        ResponseType::Drop => ""
       };
 
       let file = File::open("bench/quantiles.txt").unwrap();
@@ -330,25 +331,23 @@ impl Connection {
       let req_id = self.write_queue.front().unwrap();
       let req = self.in_flight.get_mut(req_id).unwrap();
       match req {
-        RequestState::Writing { req_type, start_time, write_buf, offset } => {
-          let req_bytes = write_buf.len();
-          match self.stream.write(&write_buf[*offset..req_bytes]) {
+        RequestState::Writing { req_type, start_time, write_frame  } => {
+          match self.stream.write(write_frame.remaining()) {
             Ok(bytes_written) => {
               let was_started = start_time.is_some();
               if !was_started {
                   *start_time = Some(Instant::now());
               }
-              if bytes_written + *offset == req_bytes {
-                *req = RequestState::Reading { 
-                  res_type: ResponseType::from_request(*req_type), 
-                  start_time: (*start_time).unwrap(), 
-                  read_buf: Vec::new(), 
-                  expected_len: None  
-                };
-                self.write_queue.pop_front().unwrap();
-              } else {
-                *offset += bytes_written;
-                break;
+              match write_frame.advance(bytes_written) {
+                WriteProgress::Partial => break,
+                WriteProgress::Done => {
+                  *req = RequestState::Reading { 
+                    exp_type: ResponseType::from_request(*req_type),
+                    start_time: (*start_time).unwrap(),
+                    read_frame: ReadFrame::new(),  
+                  };
+                  self.write_queue.pop_front().unwrap();
+                },
               }
             },
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -369,46 +368,34 @@ impl Connection {
       let req_id = self.read_queue.front().unwrap();
       let req = self.in_flight.get_mut(req_id).unwrap();
       match req {
-        RequestState::Reading { res_type, start_time, read_buf, expected_len } => {
+        RequestState::Reading { exp_type, start_time, read_frame  } => {
           let mut buf = [0; BUF_LEN];
-          let check_type = read_buf.is_empty();
           match self.stream.read(&mut buf) {
             Ok(bytes_read) => {
               if bytes_read > 0 {
-                read_buf.extend_from_slice(&buf[0..bytes_read]);
+                read_frame.push(&buf[0..bytes_read]);
               } else {
                 return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
               }
-    
-              let packet_type = ResponseType::from_value(*read_buf.first().unwrap())?;
               
-              // TODO: Add Drop packet handling
-              if check_type && *res_type != packet_type {
-                return Err(AspenRsError::ParseError(ParseError::UnexpectedMessageType{ exp_type: *res_type, given_type: packet_type }));
-              }
-    
-              if expected_len.is_none() {
-                if read_buf.len() < (1 + LEN_LENGTH) {
-                  break;
-                }
-    
-                let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().unwrap();
-                *expected_len = Some(usize::from_be_bytes(len_arr));
-              }
-    
-              let total_exp_len = 1 + LEN_LENGTH + expected_len.expect("Should not be None based on previous checks");
-    
-              if read_buf.len() < total_exp_len {
-                break;
-              } else if read_buf.len() == total_exp_len {
-                let _res = Response::deserialize(read_buf).map_err(AspenRsError::ParseError)?;
-                // optional check for response
-                let latency = start_time.elapsed().as_micros();
-                self.latencies.get_mut(res_type).unwrap().push(latency);
-                self.read_queue.pop_front().unwrap();
-                // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
-              } else {
-                return Err(AspenRsError::ParseError(ParseError::UnexpectedLength { payload_len: read_buf.len(), exp_len: total_exp_len }));
+              match read_frame.next_frame()? {
+                Some(res_buf) => {
+                  let res = Response::deserialize(&res_buf).map_err(AspenRsError::ParseError)?;
+
+                  let res_type = res.kind();
+                  if res_type == ResponseType::Drop {
+                    self.drop_count += 1;
+                  } else {
+                    if res_type != *exp_type {
+                      return Err(AspenRsError::ParseError(ParseError::UnexpectedMessageType{ given_type: res_type, exp_type: *exp_type}))
+                    }
+                    let latency = start_time.elapsed().as_micros();
+                    self.latencies.get_mut(&res_type).unwrap().push(latency);
+                  }
+                  self.read_queue.pop_front().unwrap();
+                  // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
+                },
+                None => break,
               }
             },
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -436,14 +423,12 @@ enum RequestState {
   Writing {
       req_type: RequestType,
       start_time: Option<Instant>,
-      write_buf: Vec<u8>,
-      offset: usize, // start writing at this value
+      write_frame: WriteFrame,
   },
   Reading {
-      res_type: ResponseType,
+      exp_type: ResponseType,
       start_time: Instant,
-      read_buf: Vec<u8>,
-      expected_len: Option<usize>,
+      read_frame: ReadFrame<ResponseType>,
   }
 }
 
@@ -453,9 +438,8 @@ impl RequestState {
     let write_buf = req.serialize();
     RequestState::Writing { 
       req_type: kind, 
-      start_time: None, 
-      write_buf, 
-      offset: 0
+      start_time: None,
+      write_frame: WriteFrame::new(write_buf)
     }
   }
 }

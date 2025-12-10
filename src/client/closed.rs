@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs::{self, File}, io::{ErrorKind, Read, Write}, 
 use hdrhistogram::Histogram;
 use rand::Rng;
 
-use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, ParseError, SIG_FIG, packet::{Message, MessageType, Request, RequestType, Response, ResponseType}};
+use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, ParseError, SIG_FIG, frame::{ReadFrame, WriteFrame, WriteProgress}, packet::{Message, MessageType, Request, RequestType, Response, ResponseType}};
 
 #[derive(Debug)]
 pub struct ClosedBench {
@@ -140,6 +140,7 @@ impl ClosedBench {
         ResponseType::BeRead => "beread",
         ResponseType::LcRead => "lcread",
         ResponseType::LcWrite => "lcwrite",
+        ResponseType::Drop => "",
       };
 
       let file = File::open("bench/quantiles.txt").unwrap();
@@ -284,31 +285,26 @@ impl Connection {
               self.status = ConnectionStatus::WritingRequest { 
                 req: req.kind(), 
                 start_time: None, 
-                write_buf: req.serialize(), 
-                offset: 0 
+                write_frame: WriteFrame::new(req.serialize())
               };
               Ok(Progress::MadeProgress)
             },
             None => Ok(Progress::Idle), 
           }
         },
-        ConnectionStatus::WritingRequest { req, start_time, write_buf, offset } => {
-          let req_bytes = write_buf.len();
-          match self.stream.write(&write_buf[*offset..req_bytes]) {
+        ConnectionStatus::WritingRequest { req, start_time, write_frame  } => {
+          match self.stream.write(write_frame.remaining()) {
             Ok(bytes_written) => {
               let was_started = start_time.is_some();
               if !was_started {
                   *start_time = Some(Instant::now());
               }
-              if bytes_written + *offset == req_bytes {
+              if WriteProgress::Done == write_frame.advance(bytes_written) {
                 self.status = ConnectionStatus::ReadingResponse { 
                   exp_type: ResponseType::from_request(*req), 
                   start_time: (*start_time).unwrap(), 
-                  read_buf: Vec::new(), 
-                  expected_len: None  
+                  read_frame: ReadFrame::new()
                 };
-              } else {
-                *offset += bytes_written;
               }
               if was_started {
                 return Ok(Progress::MadeProgress);
@@ -320,46 +316,32 @@ impl Connection {
             Err(e) => Err(AspenRsError::NetworkError(NetworkError::from(e)))
           }
         },
-        ConnectionStatus::ReadingResponse { exp_type, start_time, read_buf, expected_len } => {
+        ConnectionStatus::ReadingResponse { exp_type, start_time, read_frame  } => {
           let mut buf = [0; BUF_LEN];
-          let check_type = read_buf.is_empty();
           match self.stream.read(&mut buf) {
             Ok(bytes_read) => {
               if bytes_read > 0 {
-                read_buf.extend_from_slice(&buf[0..bytes_read]);
+                read_frame.push(&buf[0..bytes_read]);
               } else {
                 return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
               }
     
-              let packet_type = ResponseType::from_value(*read_buf.first().unwrap())?;
-              
-              // TODO: Add Drop packet handling
-              if check_type && *exp_type != packet_type {
-                return Err(AspenRsError::ParseError(ParseError::UnexpectedMessageType{ exp_type: *exp_type, given_type: packet_type }));
-              }
-    
-              if expected_len.is_none() {
-                if read_buf.len() < (1 + LEN_LENGTH) {
-                  return Ok(Progress::MadeProgress);
-                }
-    
-                let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().unwrap();
-                *expected_len = Some(usize::from_be_bytes(len_arr));
-              }
-    
-              let total_exp_len = 1 + LEN_LENGTH + expected_len.expect("Should not be None based on previous checks");
-    
-              if read_buf.len() < total_exp_len {
-                Ok(Progress::MadeProgress)
-              } else if read_buf.len() == total_exp_len {
-                let _res = Response::deserialize(read_buf).map_err(AspenRsError::ParseError)?;
-                // optional check for response
-                let latency = start_time.elapsed().as_micros();
-                self.status = ConnectionStatus::Ready;
-                // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
-                return Ok(Progress::CompletedResponse(packet_type, latency));
-              } else {
-                return Err(AspenRsError::ParseError(ParseError::UnexpectedLength { payload_len: read_buf.len(), exp_len: total_exp_len }));
+              match read_frame.next_frame()? {
+                Some(res_buf) => {
+                  let res = Response::deserialize(&res_buf).map_err(AspenRsError::ParseError)?;
+                  // optional check for response
+                  let latency = start_time.elapsed().as_micros();
+                  let res_type = res.kind();
+                  if res_type == ResponseType::Drop {
+                    return Err(AspenRsError::InternalError("drop packet was received in closed benchmark".to_string()));
+                  } else if res_type != *exp_type {
+                    return Err(AspenRsError::ParseError(ParseError::UnexpectedMessageType{ given_type: res_type, exp_type: *exp_type}))
+                  }
+                  self.status = ConnectionStatus::Ready;
+                  // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
+                  Ok(Progress::CompletedResponse(res_type, latency))
+                },
+                None => Ok(Progress::MadeProgress),
               }
             },
             Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(Progress::WouldBlock),
@@ -371,20 +353,18 @@ impl Connection {
   }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum ConnectionStatus {
   Ready,
   WritingRequest {
       req: RequestType,
       start_time: Option<Instant>,
-      write_buf: Vec<u8>,
-      offset: usize, // start writing at this value
+      write_frame: WriteFrame
   },
   ReadingResponse {
       exp_type: ResponseType,
       start_time: Instant,
-      read_buf: Vec<u8>,
-      expected_len: Option<usize>,
+      read_frame: ReadFrame<ResponseType>,
   }
 }
 

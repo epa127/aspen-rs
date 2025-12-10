@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
 use smol::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
-use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, packet::{Message, MessageType, Request, RequestType, Response}, store::Store};
+use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, frame::{ReadFrame, WriteFrame, WriteProgress}, packet::{Message, MessageType, Request, RequestType, Response}, store::Store};
 
 
 use async_channel::unbounded;
@@ -73,40 +73,20 @@ impl Worker {
   }
   
   async fn receive_request(&mut self) -> Result<Request, AspenRsError> {
-    let mut read_buf: Vec<u8> = Vec::new();
+    let mut frame = ReadFrame::<RequestType>::new();
     let mut buf = vec![0u8; BUF_LEN];
-    let mut req_type: Option<RequestType> = None;
-    let mut expected_len: Option<usize> = None;
 
     loop {
       let bytes_read = self.stream.read(&mut buf).await.map_err(|e| AspenRsError::NetworkError(NetworkError::from(e)))?;
       if bytes_read > 0 {
-        read_buf.extend_from_slice(&buf[0..bytes_read]);
+        frame.push(&buf[0..bytes_read]);
       } else {
-        continue;
+        return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
       }
 
-      if req_type.is_none() {
-        req_type = Some(RequestType::from_value(read_buf[0])?);
-      }
-      
-      if expected_len.is_none() {
-        if read_buf.len() < (1 + LEN_LENGTH) {
-          continue;
-        }
-
-        let len_arr: [u8; 8] = read_buf[1..(1+LEN_LENGTH)].try_into().unwrap();
-        expected_len = Some(usize::from_be_bytes(len_arr));
-      }
-
-      let total_exp_len = 1 + LEN_LENGTH + expected_len.expect("Should not be None based on previous checks");
-      
-      if read_buf.len() < total_exp_len {
-        continue
-      } else if read_buf.len() == total_exp_len {
-        return Request::deserialize(&read_buf).map_err(AspenRsError::ParseError);
-      } else {
-        return Err(AspenRsError::ParseError(crate::ParseError::UnexpectedLength { payload_len: read_buf.len(), exp_len: total_exp_len }));
+      match frame.next_frame()? {
+        Some(req) => return Request::deserialize(&req).map_err(AspenRsError::ParseError),
+        None => continue,
       }
     }
   }
@@ -131,7 +111,17 @@ impl Worker {
   }
 
   async fn send_response(&mut self, res: Response) -> Result<(), AspenRsError> {
-    let response = res.serialize();
-    self.stream.write_all(&response).await.map_err(|e| AspenRsError::NetworkError(NetworkError::from(e)))
+    let mut write_frame = WriteFrame::new(res.serialize());
+    loop {
+      match self.stream.write(write_frame.remaining()).await {
+        Ok(bytes_written) => {
+            match write_frame.advance(bytes_written) {
+                WriteProgress::Partial => continue,
+                WriteProgress::Done => return Ok(()),
+            }
+        },
+        Err(e) => return Err(AspenRsError::NetworkError(NetworkError::from(e))),
+      }
+    }
   }
 }
