@@ -8,6 +8,11 @@ Implement Open Loop:
 
 4. ~~Open loop client, spin polling connections~~
 5. Server that can handle open loop clients, namely:
-    * Has bounded packet queues
-    * Drop responses
-6. Client that uses Linux `epoll`
+    * ~~Has bounded packet queues~~
+    * ~~Drop responses~~
+    * Graceful error handling
+        * Closed connections (incl., closed channels)
+        * Add backtraces?
+6. Client edits
+    * Multi-packet read support
+    * Epoll support for Linux

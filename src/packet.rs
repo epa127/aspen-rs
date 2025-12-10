@@ -181,6 +181,14 @@ impl Request {
         },
     }
   }
+
+  pub fn get_id(&self) -> u64 {
+    match &self {
+      Request::BeRead { req_id, .. } => *req_id,
+      Request::LcRead { req_id, .. } => *req_id,
+      Request::LcWrite { req_id, .. } => *req_id,
+    }
+  }
 }
 
 impl Message for Request {
@@ -287,7 +295,7 @@ impl MessageType for ResponseType {
         ResponseType::BeRead => Some(2*size_of::<u64>()),
         ResponseType::LcRead => None,
         ResponseType::LcWrite => None,
-        ResponseType::Drop => todo!(),
+        ResponseType::Drop => Some(size_of::<u64>()),
       }
   }
 

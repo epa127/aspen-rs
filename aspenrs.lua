@@ -10,8 +10,9 @@ local SERVER_PORT = 12345  -- set this to your server's TCP port
 local BE_BYTE       = 6
 local LC_READ_BYTE  = 7
 local LC_WRITE_BYTE = 8
-local NONE_BYTE     = 0
-local SOME_BYTE     = 1
+local NONE_BYTE     = 2
+local SOME_BYTE     = 3
+local DROP_BYTE     = 1
 
 local LEN_LENGTH      = 8               -- u64
 local MSG_HDR_LEN     = 1 + LEN_LENGTH  -- kind:1 + payload_len:8
@@ -27,6 +28,7 @@ local type_vals = {
     [BE_BYTE]       = "BeRead",
     [LC_READ_BYTE]  = "LcRead",
     [LC_WRITE_BYTE] = "LcWrite",
+    [DROP_BYTE]     = "Drop"
 }
 
 local f_type    = ProtoField.uint8("aspenrs.type", "Type", base.DEC, type_vals)
@@ -240,6 +242,15 @@ local function dissect_message(buffer, pinfo, tree, kind, payload_len)
                         "Unexpected option tag: " .. tostring(tag)
                     )
                 end
+            end
+
+        elseif kind == DROP_BYTE then
+            -- Drop Response: no body
+            if body_len ~= 0 then
+                resp_tree:add_expert_info(
+                    PI_MALFORMED, PI_ERROR,
+                    "Drop response: body must be exactly 0 bytes"
+                )
             end
 
         else

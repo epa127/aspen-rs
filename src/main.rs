@@ -15,7 +15,7 @@ fn main() {
     let client_threads: usize = 3;
     let server_threads = num_threads - client_threads;
     thread::spawn(move || {
-        server::DefaultSmolServer::init(server_threads, port, tx, store);
+        server::DefaultSmolServer::init(server_threads, port, tx, store, num_threads, 10);
     });
 
     rx.recv().unwrap();
