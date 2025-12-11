@@ -15,20 +15,32 @@ fn main() {
     let client_threads: usize = 3;
     let server_threads = num_threads - client_threads;
     thread::spawn(move || {
-        server::DefaultSmolServer::init(server_threads, port, tx, store, num_threads, 10);
+        server::DefaultSmolServer::init(
+            1, 
+            port, 
+            tx, 
+            store, 
+            1, 
+            10000000);
     });
 
     rx.recv().unwrap();
 
     println!("Starting main client thread...");
     
-    closed::ClosedBench::new(2500, 0.001, 0.1, client_threads, 64).run(port);
-    // open::OpenBench::new(
-    //     2500, 
-    //     10.0,
-    //     0.001, 
-    //     0.1, 
-    //     client_threads,
-    //     64).run(port);
+    // closed::ClosedBench::new(
+    //     5, 
+    //     1.0, 
+    //     0.0, 
+    //     1, 
+    //     1).run(port);
+
+    open::OpenBench::new(
+        1, 
+        1.0,
+        0.0, 
+        0.0, 
+        1,
+        1).run(port);
 }
 

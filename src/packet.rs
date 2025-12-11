@@ -4,6 +4,7 @@ use crate::{BE_BYTE, CAPACITY, DROP_BYTE, LC_READ_BYTE, LC_WRITE_BYTE, LEN_LENGT
 pub trait Message {
   type Tag: MessageType;
   fn kind(&self) -> Self::Tag;
+  fn get_id(&self) -> u64;
   fn serialize(&self) -> Vec<u8>;
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> where Self: std::marker::Sized;
 }
@@ -84,6 +85,7 @@ impl<T: MessageType> Header for MessageHeader<T> {
   fn deserialize(packet: &[u8]) -> Result<MessageHeader<T>,ParseError> {
     // Check for header (kind + Payload_len)
     check_length(packet.len(), MessageHeader::<T>::expected_len())?;
+    // println!("88");
     let kind = T::from_value(packet[0])?;
     let len: [u8; 8] = packet[1..(LEN_LENGTH + 1)].try_into().unwrap();
     let payload_len: usize = u64::from_be_bytes(len).try_into().unwrap();
@@ -181,14 +183,6 @@ impl Request {
         },
     }
   }
-
-  pub fn get_id(&self) -> u64 {
-    match &self {
-      Request::BeRead { req_id, .. } => *req_id,
-      Request::LcRead { req_id, .. } => *req_id,
-      Request::LcWrite { req_id, .. } => *req_id,
-    }
-  }
 }
 
 impl Message for Request {
@@ -200,6 +194,14 @@ impl Message for Request {
         Request::LcRead { .. } => RequestType::LcRead,
         Request::LcWrite { .. } => RequestType::LcWrite,
       }
+  }
+
+  fn get_id(&self) -> u64 {
+    match &self {
+      Request::BeRead { req_id, .. } => *req_id,
+      Request::LcRead { req_id, .. } => *req_id,
+      Request::LcWrite { req_id, .. } => *req_id,
+    }
   }
 
   fn serialize(&self) -> Vec<u8> {
@@ -227,9 +229,11 @@ impl Message for Request {
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
+    // println!("232");
     let header = MessageHeader::deserialize(packet)?;
     
     // Check for payload length
+    // println!("236");
     check_length(packet.len(), header.len() + header.payload_len)?;
     let payload = &packet[header.len()..(header.len() + header.payload_len)];
     let payload_header = PayloadHeader::deserialize(payload)?;
@@ -237,6 +241,7 @@ impl Message for Request {
     let rest_payload = &payload[payload_header.len()..];
     match header.kind {
         RequestType::BeRead => {
+          // println!("244");
           check_length(rest_payload.len(), 1)?;
           let str = String::from_utf8_lossy(rest_payload).to_string();
           Ok(Request::BeRead { req_id: payload_header.req_id, substring: str })
@@ -246,6 +251,7 @@ impl Message for Request {
           Ok(Request::LcRead { req_id: payload_header.req_id, id })
         },
         RequestType::LcWrite => {
+          // println!("254");
           check_length(rest_payload.len(), LEN_LENGTH)?;
           let id = u64::from_be_bytes(rest_payload[0..LEN_LENGTH].try_into().unwrap());
           
@@ -279,14 +285,17 @@ impl MessageType for ResponseType {
           ResponseType::Drop => DROP_BYTE,
       }
   }
-  
+
   fn from_value(value: u8) -> Result<Self, ParseError> where Self: std::marker::Sized {
       match value {
         DROP_BYTE => Ok(ResponseType::Drop),
         BE_BYTE => Ok(ResponseType::BeRead),
         LC_READ_BYTE => Ok(ResponseType::LcRead),
         LC_WRITE_BYTE => Ok(ResponseType::LcWrite),
-        _ => Err(ParseError::InvalidMessageType(value))
+        _ => {
+          // println!("291");
+          Err(ParseError::InvalidMessageType(value))
+        }
       }
   }
   
@@ -345,6 +354,15 @@ impl Message for Response {
       }
   }
 
+  fn get_id(&self) -> u64 {
+    match &self {
+      Response::BeRead { req_id, .. } => *req_id,
+      Response::LcRead { req_id, .. } => *req_id,
+      Response::LcWrite { req_id, .. } => *req_id,
+      Response::Drop { req_id } => *req_id,
+    }
+  }
+
   fn serialize(&self) -> Vec<u8> {
     let payload = match self {
       Response::BeRead { req_id, freq } => {
@@ -376,6 +394,7 @@ impl Message for Response {
   }
 
   fn deserialize(packet: &[u8]) -> Result<Self, ParseError> {
+    // println!("394");
     let header: MessageHeader<ResponseType> = MessageHeader::deserialize(packet)?;
     
     // Check for payload length
@@ -392,7 +411,7 @@ impl Message for Response {
       },
       ResponseType::LcRead | ResponseType::LcWrite => {
         check_length(rest_payload.len(), 1)?;
-        let res = match payload[0] {
+        let res = match rest_payload[0] {
           NONE_BYTE => None,
           SOME_BYTE => {
             let username = if rest_payload.len() == 1 {
@@ -403,7 +422,7 @@ impl Message for Response {
             };
             Some(username)
           },
-          _ => {return Err(ParseError::UnexpectedOptionType(payload[0]));}
+          _ => {return Err(ParseError::UnexpectedOptionType(rest_payload[0]));}
         };
 
         match kind {
@@ -421,6 +440,7 @@ impl Message for Response {
 
 fn check_length(len: usize, exp: usize) -> Result<(), ParseError> {
   if len < exp {
+    // println!("{len} < {exp}");
     return Err(ParseError::PacketTooShort);
   } 
   Ok(())

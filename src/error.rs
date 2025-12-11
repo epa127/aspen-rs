@@ -4,25 +4,6 @@ use thiserror::Error;
 
 use crate::packet::ResponseType;
 
-pub mod client;
-pub mod server;
-pub mod packet;
-pub mod store;
-pub mod frame;
-
-const CAPACITY: usize = 8500000;
-const DROP_BYTE: u8 = 1;
-const BE_BYTE: u8 = 6;
-const LC_READ_BYTE: u8 = 7;
-const LC_WRITE_BYTE: u8 = 8;
-const NONE_BYTE: u8 = 2;
-const SOME_BYTE: u8 = 3;
-const SUBSTRING_LEN: usize = 3;
-const BUF_LEN: usize = 4096;
-const LEN_LENGTH: usize = size_of::<u64>();
-const SIG_FIG: u8 = 3;
-const YIELD_FREQ: usize = 1; // yield every 2^n best effort sub-operations
-
 #[derive(Debug, Error)]
 pub enum AspenRsError {
   #[error("network error: {0}")]

@@ -32,6 +32,7 @@ impl<T: MessageType> ReadFrame<T> {
     }
 
     if self.kind.is_none() {
+      // println!("35");
       self.kind = Some(T::from_value(self.read_buf[0])?);
     }
 
@@ -54,14 +55,19 @@ impl<T: MessageType> ReadFrame<T> {
     } else {
       let frame = self.read_buf[..total_exp_len].to_vec();
       self.read_buf.drain(..total_exp_len);
+      self.flush();
       Ok(Some(frame))
     }
   }
 
-  pub fn reset(&mut self){
+  pub fn flush(&mut self) {
     self.kind = None;
-    self.read_buf.clear();
     self.expected_len = None;
+  }
+
+  pub fn reset(&mut self){
+    self.flush();
+    self.read_buf.clear();
   }
 }
 

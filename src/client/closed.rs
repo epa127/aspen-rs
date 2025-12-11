@@ -270,7 +270,7 @@ impl Connection {
   }
 
   fn reconnect(&mut self) -> Result<(), NetworkError> {
-    let stream = TcpStream::connect(self.stream.local_addr()?)?;
+    let stream = TcpStream::connect(self.stream.peer_addr()?)?;
     stream.set_nonblocking(true)?;
     self.stream = stream;
     self.status = ConnectionStatus::Ready;

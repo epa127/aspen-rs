@@ -1,5 +1,5 @@
-use std::{collections::VecDeque, net::SocketAddr, sync::{Arc, mpsc::SyncSender}};
-use smol::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use std::{collections::VecDeque, net::SocketAddr, sync::{Arc, mpsc::SyncSender}, time::Instant};
+use smol::{future::yield_now, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
 use crate::{AspenRsError, BUF_LEN, LEN_LENGTH, NetworkError, frame::{ReadFrame, WriteFrame, WriteProgress}, packet::{Message, MessageType, Request, RequestType, Response}, store::Store};
 
 
@@ -86,8 +86,8 @@ impl IoThread {
 
   async fn run(&mut self) -> Result<(), AspenRsError> {
     loop {
-      self.refresh_queue()?;
       self.receive_requests().await?;
+      self.refresh_queue()?;
       self.send_responses().await?;
     }
   }
@@ -97,14 +97,20 @@ impl IoThread {
     let mut buf = vec![0u8; BUF_LEN];
 
     let bytes_read = self.stream.read(&mut buf).await.map_err(|e| AspenRsError::NetworkError(NetworkError::from(e)))?;
+    let start = Instant::now();
+    
     if bytes_read > 0 {
       frame.push(&buf[0..bytes_read]);
+      // println!("frame push: {:?}", Instant::now());
     } else {
       return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
     }
 
+    // println!("106");
     while let Some(req_buf) = frame.next_frame()? {
+      // println!("next frame: {:?}", Instant::now());
       let req = Request::deserialize(&req_buf).map_err(AspenRsError::ParseError)?;
+      // println!("deserialize: {:?}", Instant::now());
       let req_id = req.get_id();
       let job = Job::new(req, self.tx_resp.clone());
 
@@ -119,14 +125,18 @@ impl IoThread {
         }
       }
     }
+    println!("sent request: {:?}", Instant::now());
     Ok(())
   }
 
   fn refresh_queue(&mut self) -> Result<(), AspenRsError> {
+    let start = Instant::now();
     loop {
       match self.rx_resp.try_recv() {
         Ok(res) => {
+          println!("try_recv: {:?}", Instant::now());
           self.write_queue.push_back(WriteFrame::new(Response::serialize(&res)));
+          // println!("added to write queue and serialized: {:?}", Instant::now());
         },
         Err(e) => match e {
             TryRecvError::Empty => break,
@@ -138,12 +148,19 @@ impl IoThread {
   }
 
   async fn send_responses(&mut self) -> Result<(), AspenRsError> {
+    let start = Instant::now();
     while let Some(write_frame) = self.write_queue.front_mut() {
       match self.stream.write(write_frame.remaining()).await {
         Ok(bytes_written) => {
             match write_frame.advance(bytes_written) {
-                WriteProgress::Partial => break,
-                WriteProgress::Done => { self.write_queue.pop_front().unwrap(); },
+                WriteProgress::Partial => {
+                  yield_now().await;
+                  break;
+                },
+                WriteProgress::Done => { 
+                  self.write_queue.pop_front().unwrap();
+                  // println!("finished write: {:?}", Instant::now()); 
+                },
             }
         },
         Err(e) => return Err(AspenRsError::NetworkError(NetworkError::from(e))),
@@ -197,6 +214,7 @@ impl Worker {
         Request::LcRead { req_id, id } => {
             let id = id.try_into().unwrap();
             let username = self.store.lc_read_task(id).await;
+            // println!("execute task time: {:?}", Instant::now());
             Response::LcRead { req_id, username }
           },
         Request::LcWrite { req_id, id, username } => {

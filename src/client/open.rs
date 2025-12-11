@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, VecDeque}, fs::{self, File}, io::{ErrorKind, Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs::{self, File}, io::{ErrorKind, Read, Write}, net::TcpStream, thread::{self, JoinHandle}, time::Instant};
 
 use hdrhistogram::Histogram;
 use rand::Rng;
@@ -33,7 +33,7 @@ impl OpenBench {
       let conns_per_thr = self.conns_per_thr;
       let lc_wr_prob = self.lc_wr_ratio;
       let shift: u8 = (usize::BITS - self.num_threads.leading_zeros()).try_into().unwrap();
-      let rps = self.target_rps;
+      let rps = self.target_rps / self.num_threads as u64;
       handles.push(
         thread::spawn(move || {
           ClientThread::init(port,conns_per_thr,be_prob,
@@ -70,32 +70,33 @@ impl OpenBench {
 
     let mut drop_count = 0u64;
     let mut reqs = 0u64;
+    let mut uf = 0u64;
     for thr in client_threads {
       for (t, l) in thr.latencies {
         let hist = stat_map.get_mut(&t).unwrap();
         l.iter().for_each(|i| {let _ = hist.record(*i as u64);});
+        reqs += hist.len();
       }
 
       drop_count += thr.drop_count;
-      reqs += thr.req_id >> thr.req_id_shift;
-
-      self.general_results(reqs, drop_count, &stat_map);
-      self.latency_by_quant_distr(&stat_map);
-      
-      println!("Completed benchmark!");
+      uf += thr.unfulfilled;
     }
+    self.general_results(reqs, drop_count, uf, &stat_map);
+    self.latency_by_quant_distr(&stat_map);
+    
+    println!("Completed benchmark!");
   }
 
-  fn general_results(&self, reqs: u64, drops: u64, stat_map: &HashMap<ResponseType, Histogram<u64>>) {
+  fn general_results(&self, reqs: u64, drops: u64, uf: u64, stat_map: &HashMap<ResponseType, Histogram<u64>>) {
     let datetime = chrono::offset::Local::now();
     let header = format!("--- OPEN-LOOP BENCHMARK TEST: {datetime} ---\n");
     
     let setup = format!("SETUP:\n    THREADS: {},\n    CONNECTIONS PER THREAD: {},\n    TARGET RPS: {}\n    BE:LC RATIO: {}\n    LC WRITE:READ RATIO: {}\n\n",
         self.num_threads, self.conns_per_thr, self.target_rps, self.be_lc_ratio, self.lc_wr_ratio);
     let client = format!("CLIENT EFFECTIVENESS:\n    {} REQUESTS SENT / {} SECONDS = {} RPS \n\n",
-      reqs, self.runtime_secs, reqs as f64 / self.runtime_secs as f64);
-    let throughput = format!("THROUGHPUT: ({} REQUESTS SENT - {} REQUESTS DROPPED) / {} SECONDS = {} TASKS PER SECOND\n\n",
-       reqs, drops, self.runtime_secs, (reqs - drops) as f64 / self.runtime_secs as f64);
+      (reqs + drops + uf), self.runtime_secs, (reqs + drops + uf) as f64 / self.runtime_secs as f64);
+    let throughput = format!("THROUGHPUT: ({} REQUESTS SENT - {} REQUESTS DROPPED - {} REQUESTS UNFULFILLED) / {} SECONDS = {} TASKS PER SECOND\n\n",
+      (reqs + drops + uf), drops, uf, self.runtime_secs, (reqs as f64 / self.runtime_secs as f64));
 
     let mut stats = String::new();
     for t in ResponseType::iterator(){
@@ -178,6 +179,7 @@ struct ClientThread {
   latencies: HashMap<ResponseType, Vec<u128>>,
   drop_count: u64,
   target_rps: u64,
+  unfulfilled: u64,
 }
 
 impl ClientThread {
@@ -206,7 +208,8 @@ impl ClientThread {
         req_id_mask,
         req_id_shift,
         drop_count: 0,
-        target_rps
+        target_rps,
+        unfulfilled: 0
     }
   }
 
@@ -255,7 +258,7 @@ impl ClientThread {
 
       // progress reads
       for conn in &mut self.conns {
-        if !conn.read_queue.is_empty() && 
+        if !conn.to_read.is_empty() && 
           OpenProgress::ConnectionReset == conn.progress_reads()? {
           conn.reconnect()?;
         }
@@ -263,6 +266,7 @@ impl ClientThread {
     }
 
     for conn in &self.conns {
+      self.unfulfilled += conn.in_flight.len() as u64;
       self.drop_count += conn.drop_count;
       
       for kind in ResponseType::iterator() {
@@ -280,7 +284,8 @@ struct Connection {
 
   in_flight: HashMap<u64, RequestState>,
   write_queue: VecDeque<u64>,
-  read_queue: VecDeque<u64>,
+  to_read: HashSet<u64>,
+  read_frame: ReadFrame<ResponseType>,
 
   latencies: HashMap<ResponseType, Vec<u128>>,
   drop_count: u64,
@@ -300,19 +305,20 @@ impl Connection {
         stream,
         in_flight: HashMap::new(),
         write_queue: VecDeque::new(),
-        read_queue: VecDeque::new(),
+        to_read: HashSet::new(),
+        read_frame: ReadFrame::new(),
         latencies,
         drop_count: 0
     })
   }
 
   fn reconnect(&mut self) -> Result<(), NetworkError> {
-      let stream = TcpStream::connect(self.stream.local_addr()?)?;
+      let stream = TcpStream::connect(self.stream.peer_addr()?)?;
       stream.set_nonblocking(true)?;
       self.stream = stream;
       self.drop_count += self.in_flight.len() as u64;
       self.in_flight = HashMap::new();
-      self.read_queue = VecDeque::new();
+      self.to_read = HashSet::new();
       self.write_queue = VecDeque::new();
       Ok(())
   }
@@ -343,9 +349,9 @@ impl Connection {
                 WriteProgress::Done => {
                   *req = RequestState::Reading { 
                     exp_type: ResponseType::from_request(*req_type),
-                    start_time: (*start_time).unwrap(),
-                    read_frame: ReadFrame::new(),  
+                    start_time: (*start_time).unwrap(),  
                   };
+                  self.to_read.insert(*req_id);
                   self.write_queue.pop_front().unwrap();
                 },
               }
@@ -364,24 +370,29 @@ impl Connection {
   }
 
   fn progress_reads(&mut self) -> Result<OpenProgress, AspenRsError> {
-    while self.read_queue.front().is_some() {
-      let req_id = self.read_queue.front().unwrap();
-      let req = self.in_flight.get_mut(req_id).unwrap();
-      match req {
-        RequestState::Reading { exp_type, start_time, read_frame  } => {
-          let mut buf = [0; BUF_LEN];
-          match self.stream.read(&mut buf) {
-            Ok(bytes_read) => {
-              if bytes_read > 0 {
-                read_frame.push(&buf[0..bytes_read]);
-              } else {
-                return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
+    while !self.to_read.is_empty() {
+      let mut buf = [0; BUF_LEN];
+      match self.stream.read(&mut buf) {
+        Ok(bytes_read) => {
+          if bytes_read > 0 {
+            self.read_frame.push(&buf[0..bytes_read]);
+          } else {
+            return Err(AspenRsError::NetworkError(NetworkError::ConnectionClosed));
+          }
+          // println!("378");
+          while let Some(res_buf) = self.read_frame.next_frame()? {
+              // println!("380");
+              // println!("{:?}", res_buf);
+              let res = Response::deserialize(&res_buf).map_err(AspenRsError::ParseError)?;
+              let req_id = res.get_id();
+              if !self.to_read.contains(&req_id) {
+                return Err(AspenRsError::InternalError("received req_id that is not in a to_read state".into()))
               }
-              
-              match read_frame.next_frame()? {
-                Some(res_buf) => {
-                  let res = Response::deserialize(&res_buf).map_err(AspenRsError::ParseError)?;
-
+              let req_state = self.in_flight.get_mut(&req_id).unwrap();
+              match req_state {
+                RequestState::Writing { .. } => 
+                  {return Err(AspenRsError::InternalError(format!("request {req_id} in read queue with write state")));},
+                RequestState::Reading { exp_type, start_time } => {
                   let res_type = res.kind();
                   if res_type == ResponseType::Drop {
                     self.drop_count += 1;
@@ -392,20 +403,16 @@ impl Connection {
                     let latency = start_time.elapsed().as_micros();
                     self.latencies.get_mut(&res_type).unwrap().push(latency);
                   }
-                  self.read_queue.pop_front().unwrap();
-                  // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
+                  self.to_read.remove(&req_id);
+                  self.in_flight.remove(&req_id);
                 },
-                None => break,
               }
-            },
-            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == ErrorKind::ConnectionReset => return Ok(OpenProgress::ConnectionReset),
-            Err(e) => return Err(AspenRsError::NetworkError(NetworkError::from(e)))
+              // println!("Response {:?} received from {} in {} µs", _res, self.stream.local_addr().unwrap(), latency);
           }
         },
-        RequestState::Writing { .. } => {
-          return Err(AspenRsError::InternalError(format!("request {req_id} in read queue with write state")));
-        },
+        Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(OpenProgress::MadeProgress),
+        Err(e) if e.kind() == ErrorKind::ConnectionReset => return Ok(OpenProgress::ConnectionReset),
+        Err(e) => return Err(AspenRsError::NetworkError(NetworkError::from(e)))
       }
     }
     Ok(OpenProgress::MadeProgress)
@@ -428,7 +435,6 @@ enum RequestState {
   Reading {
       exp_type: ResponseType,
       start_time: Instant,
-      read_frame: ReadFrame<ResponseType>,
   }
 }
 
